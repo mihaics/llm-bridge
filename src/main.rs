@@ -66,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
         defaults: cfg.defaults.clone(),
         progress_channel: cfg.server.progress_channel,
         credentials: cfg.credentials.clone(),
+        suspended: Arc::new(llm_bridge::suspend::SuspendedSessions::new(cfg.defaults.max_suspended_sessions)),
+        tool_result_timeout: Duration::from_secs(cfg.defaults.tool_result_timeout_s),
     };
 
     let app = build_router(state);

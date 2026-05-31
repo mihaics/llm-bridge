@@ -5,7 +5,9 @@ use llm_bridge::http::{build_router, AppState};
 use llm_bridge::orchestrator::TurnRunner;
 use llm_bridge::registry::Registry;
 use llm_bridge::session::SessionStore;
+use llm_bridge::suspend::SuspendedSessions;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 struct FakeRunner { events: Vec<AgentEvent> }
@@ -16,10 +18,12 @@ impl TurnRunner for FakeRunner {
 }
 
 fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
-    let models = vec![ModelEntry {
-        id: "claude-text".into(), engine: EngineKind::Claude, model: Some("sonnet".into()),
-        workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false,
-    }];
+    let models = vec![
+        ModelEntry { id: "claude-text".into(), engine: EngineKind::Claude, model: Some("sonnet".into()),
+            workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false },
+        ModelEntry { id: "codex-text".into(), engine: EngineKind::Codex, model: Some("gpt-5".into()),
+            workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false },
+    ];
     AppState {
         registry: Arc::new(Registry::new(models)),
         bearer_token: token.map(String::from),
@@ -28,6 +32,8 @@ fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
         defaults: Defaults::default(),
         progress_channel: ProgressChannel::ReasoningContent,
         credentials: Credentials::default(),
+        suspended: Arc::new(SuspendedSessions::new(8)),
+        tool_result_timeout: Duration::from_secs(120),
     }
 }
 fn fake(events: Vec<AgentEvent>) -> Arc<dyn TurnRunner> { Arc::new(FakeRunner { events }) }
@@ -134,4 +140,93 @@ async fn unknown_model_404_and_tools_400() {
     assert_eq!(r1.status(), 404);
     let r2 = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(r#"{"model":"claude-text","tools":[{"x":1}],"messages":[]}"#)).unwrap()).await.unwrap();
     assert_eq!(r2.status(), 400);
+}
+
+#[tokio::test]
+async fn tools_to_codex_rejected_unsupported() {
+    let app = build_router(state(None));
+    let body = r#"{"model":"codex-text","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(body_string(r).await.contains("not supported for engine 'codex'"));
+}
+
+#[tokio::test]
+async fn tools_to_claude_deferred_to_phase4b() {
+    let app = build_router(state(None));
+    let body = r#"{"model":"claude-text","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(body_string(r).await.contains("Phase 4b"));
+}
+
+fn state_with_suspension(ids: &[&str]) -> (AppState, Vec<tokio::sync::oneshot::Receiver<String>>) {
+    let st = state(None);
+    let mut pairs = Vec::new();
+    let mut rxs = Vec::new();
+    for id in ids {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pairs.push(((*id).to_string(), tx));
+        rxs.push(rx);
+    }
+    let cont: EventStream = Box::pin(futures::stream::iter(vec![
+        AgentEvent::AssistantText("resumed".into()),
+        AgentEvent::Done { finish_reason: "stop".into() },
+    ]));
+    st.suspended.register(pairs, cont).unwrap();
+    (st, rxs)
+}
+
+fn followup_body(results: &[(&str, &str)]) -> String {
+    // The assistant message echoes the tool_calls; each result is a trailing role:"tool" message.
+    let assistant_tool_calls: Vec<String> = results.iter().map(|(id, _)|
+        format!(r#"{{"id":"{id}","type":"function","function":{{"name":"f","arguments":"{{}}"}}}}"#)).collect();
+    let tool_result_msgs: Vec<String> = results.iter().map(|(id, res)|
+        format!(r#"{{"role":"tool","tool_call_id":"{id}","content":"{res}"}}"#)).collect();
+    format!(r#"{{"model":"claude-text","messages":[
+        {{"role":"user","content":"do it"}},
+        {{"role":"assistant","content":null,"tool_calls":[{}]}},
+        {}
+    ]}}"#, assistant_tool_calls.join(","), tool_result_msgs.join(","))
+}
+
+#[tokio::test]
+async fn followup_with_stray_tools_field_still_routes_to_suspension() {
+    // A follow-up that also carries a top-level `tools` field must STILL route by shape to the
+    // parked suspension (routing precedes the tools gate), not get rejected by the tools gate.
+    let (st, _rxs) = state_with_suspension(&["call_a"]);
+    let app = build_router(st);
+    let body = r#"{"model":"claude-text","tools":[{"type":"function","function":{"name":"f"}}],"messages":[
+        {"role":"user","content":"do it"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"call_a","content":"RES"}
+    ]}"#;
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 200); // resumed, NOT a 400 from the tools gate
+    assert!(body_string(r).await.contains("resumed"));
+}
+
+#[tokio::test]
+async fn tool_result_followup_resumes_suspension() {
+    let (st, _rxs) = state_with_suspension(&["call_a"]);
+    let app = build_router(st);
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(followup_body(&[("call_a","RES")]))).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(body_string(r).await.contains("resumed"));
+}
+
+#[tokio::test]
+async fn partial_tool_results_409() {
+    let (st, _rxs) = state_with_suspension(&["call_a", "call_b"]);
+    let app = build_router(st);
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(followup_body(&[("call_a","RES")]))).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(body_string(r).await.contains("call_b"));
+}
+
+#[tokio::test]
+async fn unknown_tool_result_400() {
+    let app = build_router(state(None));
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(followup_body(&[("call_x","RES")]))).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 400);
 }

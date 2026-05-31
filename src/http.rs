@@ -1,14 +1,16 @@
 //! HTTP layer: shared state, router, health/models, bearer auth, and the chat-completions handler
 //! (SSE when `stream:true`, aggregated otherwise). Both paths consume the same event stream.
 use crate::config::{Credentials, Defaults, EngineKind, ProgressChannel};
-use crate::engine::AgentEvent;
+use crate::engine::{AgentEvent, EventStream};
 use crate::openai::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, DeltaFunctionCall,
     DeltaToolCall,
 };
 use crate::orchestrator::{response_from_events, run_request, runtime_fingerprint, TurnRunner};
 use crate::registry::Registry;
+use crate::routing::tool_result_suffix;
 use crate::session::SessionStore;
+use crate::suspend::{DeliverError, SuspendedSessions};
 use axum::{
     extract::State,
     http::{header::AUTHORIZATION, Request, StatusCode},
@@ -31,6 +33,8 @@ pub struct AppState {
     pub defaults: Defaults,                // used for sandbox_backend in the runtime fingerprint
     pub progress_channel: ProgressChannel, // from cfg.server.progress_channel (NOT on Defaults)
     pub credentials: Credentials, // per-engine home dirs feed the runtime fingerprint
+    pub suspended: Arc<SuspendedSessions>,
+    pub tool_result_timeout: Duration, // reserved for the registration path wired in Phase 4b
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -63,9 +67,6 @@ async fn auth_middleware(State(state): State<AppState>, req: Request<axum::body:
 }
 
 async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCompletionRequest>) -> Response {
-    if req.has_tools() {
-        return err(StatusCode::BAD_REQUEST, "the `tools` field is not implemented yet (Phase 4)", "invalid_request_error");
-    }
     let Some(entry) = state.registry.resolve(&req.model) else {
         return err(StatusCode::NOT_FOUND, &format!("unknown model '{}'", req.model), "model_not_found");
     };
@@ -74,6 +75,47 @@ async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCom
     let streaming = req.is_streaming();
     let progress = state.progress_channel;
 
+    // (1) Tool-result follow-up? Route the trailing role:"tool" suffix to its parked suspension.
+    if let Some(results) = tool_result_suffix(&req.messages) {
+        return match state.suspended.deliver(&results) {
+            Ok(continuation) => finish(continuation, model_id, streaming, progress).await,
+            Err(DeliverError::Partial(missing)) => err(
+                StatusCode::CONFLICT,
+                &format!("incomplete tool results; still awaiting: {}", missing.join(", ")),
+                "invalid_request_error",
+            ),
+            Err(DeliverError::Duplicate(id)) => err(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate tool result for tool_call_id '{id}'"),
+                "invalid_request_error",
+            ),
+            Err(DeliverError::Unknown) => err(
+                StatusCode::BAD_REQUEST,
+                "unknown or expired tool_call_id(s); no live suspended turn matches",
+                "invalid_request_error",
+            ),
+        };
+    }
+
+    // (2) New turn carrying `tools` -> gate per engine capability.
+    if req.has_tools() {
+        if !crate::engine::caps_for(entry.engine).mcp_tools {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("`tools` (function calling) is not supported for engine '{}'", entry.engine.as_str()),
+                "invalid_request_error",
+            );
+        }
+        // claude is MCP-capable, but the live in-process MCP bridge that creates suspensions
+        // is delivered in Phase 4b.
+        return err(
+            StatusCode::BAD_REQUEST,
+            "the MCP tool bridge is not yet enabled (Phase 4b)",
+            "invalid_request_error",
+        );
+    }
+
+    // (3) Ordinary turn.
     let engine_home = match entry.engine {
         EngineKind::Claude => state.credentials.claude_config_dir.clone(),
         EngineKind::Codex => state.credentials.codex_home.clone(),
@@ -81,7 +123,11 @@ async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCom
     };
     let rt = runtime_fingerprint(&engine_home, state.defaults.sandbox_backend.as_str());
     let events = run_request(state.runner.clone(), state.sessions.clone(), &entry, &req, &rt);
+    finish(events, model_id, streaming, progress).await
+}
 
+/// Shared tail: stream the events as SSE, or aggregate into one completion.
+async fn finish(events: EventStream, model_id: String, streaming: bool, progress: ProgressChannel) -> Response {
     if streaming {
         sse_response(events, model_id, progress).into_response()
     } else {
