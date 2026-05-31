@@ -1,6 +1,7 @@
 pub mod config;
 pub mod engine;
 pub mod http;
+pub mod mcp;
 pub mod openai;
 pub mod orchestrator;
 pub mod process;
