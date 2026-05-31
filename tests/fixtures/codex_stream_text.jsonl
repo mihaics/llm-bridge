@@ -1,0 +1,5 @@
+{"type":"session_configured","session_id":"codex-sess-1"}
+{"type":"agent_reasoning","text":"the user wants pong"}
+{"type":"exec_command_begin","command":["bash","-lc","echo hi"]}
+{"type":"agent_message","message":"pong"}
+{"type":"task_complete"}
