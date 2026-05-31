@@ -31,7 +31,9 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 
 ### Non-goals
 - Reimplementing the agents or talking to model vendor APIs directly. We always shell out to
-  the installed CLI and rely on its existing local login/auth.
+  the installed CLI and use a **dedicated, operator-provisioned per-engine credential dir**
+  (§4.8) — not the operator's interactive login dir, so the service is isolated from unrelated
+  secrets while still authenticated.
 - A web UI of our own. Clients (OpenWebUI, etc.) provide the UI.
 - Endpoints/features beyond Chat Completions + Models, or features the CLIs don't support.
 
@@ -41,10 +43,10 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 |---|---|
 | Scope | **Full agentic passthrough** — expose file edits, tool use, sessions |
 | Workspace selection | **Config-driven model list**: config registers named tuples, each published as a model in `/v1/models`; an OpenWebUI Pipe is the escape hatch for explicit per-request dirs |
-| Session continuity | **Content-hash resume**, keyed on the conversation projection **+ a ModelEntry fingerprint** |
-| Progress output | Tool activity → **`reasoning_content`** (visible, NOT persisted/resent); final answer → `content`. Streaming engines only |
+| Session continuity | **Content-hash resume** (hit = resume + last turn; **miss = fresh + full projected conversation**), keyed on a tool-aware conversation projection **+ a ModelEntry fingerprint** |
+| Progress output | **Per-client profile**: OpenWebUI → `reasoning_content` (visible, NOT persisted); strict OpenAI clients → standard chunks only (progress omitted). Final answer always → `content`. Streaming engines only |
 | OpenAI `tools` | **Bridge to MCP**; suspended sessions keyed by **`tool_call_id`** |
-| Safety posture | **Sandboxed full-auto**, with a hardened HTTP/host boundary (localhost default, env/HOME isolation, path canonicalization) |
+| Safety posture | **Sandboxed full-auto**, with a hardened HTTP/host boundary (localhost default, **dedicated provisioned credential dirs**, env isolation, path canonicalization) |
 | Process model | **Re-spawn with native resume** (map session-key → CLI session id); the MCP suspended-session is the one stateful exception |
 | Build scope | **All in from v1** — MCP bridge is core, not deferred (build is ordered, not phased) |
 
@@ -77,12 +79,19 @@ Verified against the installed binaries:
 
 Consequences baked into the design:
 - **agy is a non-streaming, final-text-only adapter** in v1: no progress, no tool events,
-  coarse boolean sandbox. Resume works via `--conversation <id>`.
+  coarse boolean sandbox. Its session id is **not** emitted on stdout (unlike claude/codex), so
+  **agy resume is gated** on a proven session-id capture spike (§9). Until proven, agy runs
+  **stateless replay** — the full projected conversation fed each turn (the miss path, §4.5) —
+  which is correct, just slower. `--conversation <id>` is wired only once capture is proven.
 - **claude and codex are streaming adapters** with distinguishable tool events and a separable
-  final answer — which is what makes the `reasoning_content` split (§4.4) clean.
+  final answer — which is what makes the progress/`content` split (§4.4) clean. Both emit their
+  session id in their event stream (claude `stream-json` init/result; codex `--json` events),
+  so resume-by-id is reliable.
 - `codex` has the richest controls (`-s` sandbox levels, `--cd`/`--add-dir`,
-  `--ignore-user-config`, `--ephemeral`, `shell_environment_policy`, `--output-last-message`,
-  `--output-schema`); the adapter uses them for isolation and clean output capture.
+  `--ignore-user-config`, `--output-last-message`, `--output-schema`); the adapter uses them
+  for isolation and clean output capture. **`--ephemeral` is used only for no-resume (`text`)
+  profiles** — it does not persist session files, so resumable runs instead use a dedicated
+  persistent `CODEX_HOME` (§4.8).
 
 ## 4. Architecture
 
@@ -159,21 +168,23 @@ impl Engine {
 Per-engine specifics (from §3.2):
 - **Claude** → `-p --output-format stream-json`, `--system-prompt`, `--model`,
   `--continue`/`--resume <id>`; sandbox via confined workdir + tool allow/deny policy.
-- **Codex** → `codex exec --json` (JSONL events), `--output-last-message <file>` for the clean
-  final answer, `exec resume <id>` / `--last`, `-s <level>` sandbox, `--cd`/`--add-dir`,
-  isolation via `--ignore-user-config` / `--ephemeral` / `-c shell_environment_policy=...`;
-  MCP via `codex mcp` config.
-- **Agy** → `--print` (plain text, non-streaming), `--conversation <id>` / `--continue`,
-  `--sandbox` (boolean), `--add-dir <workspace>`; MCP via `~/.gemini/config/mcp_config.json`.
-  Emits a single `AssistantText` + `Done`; `caps().streaming == false`.
+- **Codex** → `codex exec --json` (JSONL events; carries the session id), `--output-last-message
+  <file>` for the clean final answer, `exec resume <id>` / `--last`, `-s <level>` sandbox,
+  `--cd`/`--add-dir`, isolation via a dedicated persistent `CODEX_HOME` + `--ignore-user-config`
+  + `-c shell_environment_policy.inherit=...`. **`--ephemeral` only on `text` profiles** (it
+  disables session persistence and would break resume). MCP via `codex mcp` config.
+- **Agy** → `--print` (plain text, non-streaming), `--add-dir <workspace>`, `--sandbox`
+  (boolean); MCP via `~/.gemini/config/mcp_config.json`. Emits a single `AssistantText` +
+  `Done`; `caps().streaming == false`. `--conversation <id>` resume is wired **only after** the
+  session-id capture spike succeeds (§9); otherwise stateless replay.
 
 Normalized event type and channel mapping:
 
 ```rust
 enum AgentEvent {
     AssistantText(String),    // → OpenAI `content` delta (persisted by client)
-    ToolStart { name, args }, // → `reasoning_content` delta ("🔧 Editing src/foo.rs")
-    ToolResult { summary },    // → `reasoning_content` delta
+    ToolStart { name, args }, // → progress, routed per profile ("🔧 Editing src/foo.rs")
+    ToolResult { summary },    // → progress, routed per profile
     ToolCall { id, name, args }, // → OpenAI `tool_calls` delta (MCP bridge, §4.6)
     SessionId(CliSessionId),   // → captured for the session store
     Error(String),             // → OpenAI error
@@ -181,25 +192,40 @@ enum AgentEvent {
 }
 ```
 
-**Channel rule (Finding 2):** only the agent's **final answer** goes to `content`; all tool
-activity goes to **`reasoning_content`**, which OpenWebUI renders (collapsible) but does **not**
-persist into the resent history. This keeps the conversation OpenWebUI replays — and the
-content-hash computed from it — free of synthetic progress text. For non-streaming `agy`, only
-the final answer exists, so it maps straight to `content`.
+**Channel rule (per-client profile):** the agent's **final answer** always goes to `content`.
+Tool activity is routed by the configured **client profile** (`progress_channel`, §6), because
+`reasoning_content` is an OpenWebUI/DeepSeek convention, **not** part of the strict OpenAI Chat
+Completions schema:
+- `reasoning_content` (default, OpenWebUI): progress streams as `delta.reasoning_content`, which
+  OpenWebUI renders (collapsible) but does **not** persist into the resent history — keeping the
+  replayed conversation and the content-hash free of synthetic progress text.
+- `omit` (strict OpenAI clients): only standard chunks (`content`, `tool_calls`) are emitted;
+  progress is suppressed so we never put non-standard fields on the wire or pollute `content`.
+
+For non-streaming `agy`, only the final answer exists, so it maps straight to `content`
+regardless of profile.
 
 ### 4.5 Session continuity (content-hash resume)
-- **Key** = hash of (a) the conversation **projection** — roles + `content` of each message,
-  excluding `reasoning_content` and progress, for the **prefix** (all messages except the final
-  user turn) — **plus** (b) the **ModelEntry fingerprint** (engine, model, workspace, mode,
-  permissions). The fingerprint prevents a config that reuses an id with a changed
-  workspace/model/permissions from resuming the wrong CLI session.
-- Lookup `key → CliSessionId`. **Hit:** spawn with the engine's resume flag, feed only the new
-  user turn. **Miss:** fresh session; capture the `SessionId` event, store `key′ → sid` where
-  `key′` includes the just-completed turn, so the next request (whose prefix now includes this
-  turn) resolves to it.
+- **Projection** (the normalized view we hash and, on a miss, replay) = for each message: its
+  `role`, its `content`, **and for assistant messages its normalized `tool_calls`
+  (name + canonicalized args) and for `role:"tool"` messages its `tool_call_id` + result
+  content**. It excludes `reasoning_content`/progress. Including tool calls and the
+  `tool_call_id` linkage prevents post-tool conversations from colliding or resuming the wrong
+  native session (otherwise two threads that differ only in tool activity hash identically).
+- **Key** = hash of (a) the projection of the **prefix** (all messages except the final user
+  turn) **plus** (b) the **ModelEntry fingerprint** (engine, model, workspace, mode,
+  permissions), which stops a reused id with changed workspace/model/permissions from resuming
+  the wrong CLI session.
+- Lookup `key → CliSessionId`:
+  - **Hit:** spawn with the engine's resume flag and feed **only the new user turn** (the CLI
+    already holds the prior context on disk).
+  - **Miss** (no entry, or the index was lost on restart): start a **fresh session and feed the
+    full serialized projected conversation**, not just the last turn — so context resent by
+    OpenWebUI is never dropped. Capture the `SessionId` event and store `key′ → sid` where
+    `key′` includes the just-completed turn, so the next request resolves to a hit.
 - Store: in-memory map with optional `sled` persistence + idle-TTL GC. The server holds no
-  agent state itself — the real session lives in the CLI's own on-disk store; a server restart
-  loses only the key→sid index (worst case: a fresh session next turn).
+  agent state itself — the real session lives in the CLI's own on-disk store; a restart loses
+  only the key→sid index, degrading to the (correct) full-replay miss path.
 
 ### 4.6 MCP Tool Bridge (for OpenAI `tools`)
 When a request carries `tools`:
@@ -211,7 +237,7 @@ When a request carries `tools`:
    request** containing the assistant message with that `tool_calls` entry **and** a
    `role:"tool"` message carrying the matching **`tool_call_id`** — *not* a new user turn.
 
-**Suspended-session mechanism, keyed by `tool_call_id` (Finding 1):** the process that hit a
+**Suspended-session mechanism, keyed by `tool_call_id`:** the process that hit a
 client tool call is **held open** (with its parked MCP call) in a `SuspendedSessions` registry
 keyed by the emitted **`tool_call_id`(s)**. The orchestrator (§4.3 step 2) detects a follow-up
 by matching the request's `tool` messages' `tool_call_id`s against this registry — *not* by the
@@ -227,16 +253,25 @@ keyed by `tool_call_id`, and time-limited.
 Spawns child CLIs via `tokio::process`; per-turn timeouts (→ `504`); a global concurrency cap
 with a bounded queue; cancellation/kill on client disconnect or shutdown.
 
-### 4.8 Safety / permissions (hardened — Finding 4)
+### 4.8 Safety / permissions (hardened)
 The agent posture is **sandboxed full-auto**, but because this is an HTTP service that triggers
 file edits and command execution, the boundary is hardened on multiple axes:
 
 - **Network:** bind `127.0.0.1` by default; non-loopback bind requires an explicit non-default
   bearer token or the server refuses to start. Auth on all `/v1/*` routes.
-- **Host/identity isolation:** spawn each CLI with an isolated env — scrub/whitelist env vars,
-  set a per-engine `HOME`/`CODEX_HOME`/config dir so a request can't read the operator's
-  unrelated secrets; codex uses `--ignore-user-config` + `--ephemeral` +
-  `-c shell_environment_policy.inherit=...`.
+- **Host/identity isolation + credential provisioning:** spawn each CLI with an isolated env —
+  scrub/whitelist env vars and point each engine at a **dedicated service config dir** rather
+  than the operator's interactive one (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, agy's `~/.gemini`
+  equivalent). This both keeps a request from reading the operator's unrelated secrets *and*
+  supplies the auth the CLI needs — resolving the tension with "use the installed login." Each
+  service dir is **provisioned once** by the operator via one of:
+  1. a one-time interactive login into the service dir (`CLAUDE_CONFIG_DIR=… claude login`,
+     `CODEX_HOME=… codex login`, etc.) — the documented default;
+  2. copying only the minimal auth/token file into the service dir; or
+  3. an API-key env var for engines that accept one.
+  These dirs are **persistent** (not `--ephemeral`): codex resumable runs need a stable
+  `CODEX_HOME` to keep session files; `--ephemeral` is reserved for `text` profiles that never
+  resume. The provisioning steps are part of the deployment docs.
 - **Workspace confinement:** canonicalize the configured workspace path, reject symlinks that
   escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
 - **Per-engine sandbox is documented, not assumed uniform:** codex `read-only` /
@@ -248,14 +283,16 @@ file edits and command execution, the boundary is hardened on multiple axes:
 
 ## 5. Data flow
 
-**Non-streaming chat completion** — resolve model → entry; compute session key; resolve session;
-spawn; consume `AgentEvent`s to completion; assemble (final text → `content`, tool activity →
-`reasoning_content`); return one `chat.completion`.
+**Non-streaming chat completion** — resolve model → entry; compute session key; resolve session
+(**hit:** resume + last turn; **miss:** fresh + full projected conversation); spawn; consume
+`AgentEvent`s to completion; assemble (final text → `content`, progress per profile); return one
+`chat.completion`.
 
 **Streaming chat completion** — same setup, respond `text/event-stream`; each `AgentEvent` → a
-`chat.completion.chunk` (`delta.content` for final text, `delta.reasoning_content` for progress,
-`delta.tool_calls` when bridging); `[DONE]` at `Done`; client disconnect cancels the child.
-(`agy`: a single final-text chunk, no progress.)
+`chat.completion.chunk` (`delta.content` for final text; progress → `delta.reasoning_content`
+under the `reasoning_content` profile, suppressed under `omit`; `delta.tool_calls` when
+bridging); `[DONE]` at `Done`; client disconnect cancels the child. (`agy`: a single final-text
+chunk, no progress.)
 
 **Tool-call round trip (MCP bridge)** — request with `tools` → MCP server up, CLI wired in;
 agent calls a tool → emit `tool_calls` (with `tool_call_id`), finish `tool_calls`, **suspend**
@@ -269,11 +306,16 @@ result into the parked MCP call, the agent continues, the response resumes.
 server:
   bind: "127.0.0.1:8088"        # non-loopback bind requires a real bearer_token
   bearer_token: "sk-..."        # required if bind is non-loopback
+  progress_channel: reasoning_content  # reasoning_content (OpenWebUI) | omit (strict OpenAI)
 defaults:
   timeout_s: 600
   max_concurrency: 4
   session_store: { backend: sled, path: ~/.llm-bridge/sessions, ttl_h: 24 }
-  isolation: { ephemeral_home: true, env_passthrough: ["PATH", "LANG"] }
+  env_passthrough: ["PATH", "LANG"]    # everything else scrubbed from spawned CLIs
+credentials:                    # dedicated, persistent, operator-provisioned per-engine dirs
+  claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR
+  codex_home: ~/.llm-bridge/cred/codex           # CODEX_HOME (persistent — enables resume)
+  agy_config_dir: ~/.llm-bridge/cred/gemini      # agy ~/.gemini equivalent
 models:
   - id: "claude-opus-repoA"
     engine: claude               # claude | codex | agy
@@ -324,11 +366,15 @@ everything else.
 3. Process Supervisor (spawn, isolation/env scrub, timeout, concurrency, cancellation).
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
 5. SSE streaming + event→chunk mapping (final → `content`, progress → `reasoning_content`).
-6. Session Store + content-hash resume (projection + ModelEntry fingerprint).
-7. `CodexAdapter` (JSONL + `--output-last-message`, sandbox levels) and `AgyAdapter`
-   (non-streaming, `--conversation` resume).
+6. Session Store + content-hash resume: tool-aware projection + ModelEntry fingerprint;
+   **hit = resume + last turn, miss = fresh + full projected conversation**.
+7. `CodexAdapter` (JSONL + `--output-last-message`, sandbox levels, persistent `CODEX_HOME`;
+   `--ephemeral` only on `text`). `AgyAdapter` ships **stateless-replay first**; a
+   **session-id capture spike** gates wiring `--conversation` resume — if capture can't be
+   proven, agy stays replay-only in v1 (logged as a known limitation).
 8. MCP Tool Bridge + suspended sessions keyed by `tool_call_id` (OpenAI `tools` round trip).
-9. Security/sandbox hardening pass + per-engine sandbox docs, observability polish, e2e smoke.
+9. Credential-provisioning + security/sandbox hardening pass, per-engine sandbox docs,
+   client-profile (`progress_channel`) wiring, observability polish, e2e smoke.
 
 ## 10. Open questions / risks
 - **MCP wiring per engine** differs (config file vs flag); each adapter owns its setup/teardown.
@@ -336,8 +382,11 @@ everything else.
   `mcp_config.json` path and whether it honors per-invocation MCP servers in `--print` mode.
 - **Suspended-session vs client retry:** if OpenWebUI retries instead of returning the tool
   result, the suspension times out and the next turn starts fresh (acceptable degradation).
-- **agy depth:** confirmed non-streaming with `--conversation` resume and boolean sandbox;
-  validate that `--conversation <id>` reliably resumes in `--print` mode and that the session id
-  is discoverable (it isn't in stdout like claude/codex — may require reading agy's session dir).
+- **agy resume is gated, not assumed:** agy ships stateless-replay-first; the §9 spike must
+  prove a session-id capture mechanism (agy doesn't print it on stdout — likely requires reading
+  agy's session dir under its config dir) before `--conversation <id>` resume is wired. If
+  unprovable, agy stays replay-only in v1.
+- **Credential provisioning is an operator step:** the dedicated per-engine config dirs must be
+  logged into / populated once before agentic models work; document per engine.
 - **Sandbox strength is the engine's, not ours:** "full-auto" trusts each CLI's sandbox; agy's
   coarse boolean sandbox is the weakest and should be documented as such.
