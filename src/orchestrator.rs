@@ -1,7 +1,7 @@
 //! Turn orchestration: the streaming `TurnRunner`, the production `EngineProcessRunner`, the
 //! session-aware `run_request` (key resolution, resume vs fresh, capture + index advancement),
 //! and the events->response aggregation used by the non-streaming path.
-use crate::config::{Credentials, EngineKind, ModelEntry, SandboxBackend};
+use crate::config::{Credentials, EngineKind, Mode, ModelEntry, SandboxBackend};
 use crate::engine::agy::AgyAdapter;
 use crate::engine::claude::ClaudeAdapter;
 use crate::engine::codex::CodexAdapter;
@@ -109,6 +109,14 @@ fn system_prompt_of(req: &ChatCompletionRequest) -> Option<String> {
     render_turn(&req.messages).system_prompt
 }
 
+/// Whether this turn's native session may be resumed/stored. Beyond the engine's `resume_by_id`,
+/// codex `text` mode runs with `--ephemeral` (no persisted session), so storing its session id
+/// would later resume against a session codex never kept — gate it off.
+fn turn_resumable(entry: &ModelEntry) -> bool {
+    caps_for(entry.engine).resume_by_id
+        && !(entry.engine == EngineKind::Codex && entry.mode == Mode::Text)
+}
+
 /// Text of the final user message (the live instruction fed on a resume hit).
 fn final_user_text(messages: &[ChatMessage]) -> String {
     messages
@@ -132,7 +140,7 @@ pub fn run_request(
 ) -> EventStream {
     let sys = system_prompt_of(req);
     let key = lookup_key(&req.messages, entry, sys.as_deref(), rt);
-    let can_resume = caps_for(entry.engine).resume_by_id;
+    let can_resume = turn_resumable(entry);
     let hit = if can_resume { sessions.get(&key) } else { None };
 
     let rendered = render_turn(&req.messages);
@@ -338,5 +346,25 @@ mod tests {
         // Even after a SessionId event, a non-resume engine stores nothing.
         let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None }, umsg("second")];
         assert_eq!(store.get(&crate::session::lookup_key(&m2, &agy, None, &rt())), None);
+    }
+
+    #[tokio::test]
+    async fn codex_text_mode_never_resumes_or_stores() {
+        // codex `text` runs --ephemeral (no persisted session), so resume must be gated off even
+        // though caps_for(Codex).resume_by_id == true — otherwise a later turn would resume a
+        // session codex never kept.
+        let store = Arc::new(SessionStore::new());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let codex_text = ModelEntry { id: "m".into(), engine: EngineKind::Codex, model: None,
+            workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false };
+        let runner: Arc<dyn TurnRunner> = Arc::new(FakeRunner {
+            events: vec![AgentEvent::SessionId("eph".into()), AgentEvent::AssistantText("a".into()), AgentEvent::Done { finish_reason: "stop".into() }],
+            seen: seen.clone(),
+        });
+        let messages = vec![umsg("first")];
+        let _ = run_request(runner, store.clone(), &codex_text, &req(messages), &rt()).collect::<Vec<_>>().await;
+        assert!(seen.lock().unwrap().clone().unwrap().resume.is_none());
+        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None }, umsg("second")];
+        assert_eq!(store.get(&crate::session::lookup_key(&m2, &codex_text, None, &rt())), None);
     }
 }

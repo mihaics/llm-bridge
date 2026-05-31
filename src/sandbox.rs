@@ -131,9 +131,17 @@ pub fn run_probes(workspace: Option<&Path>, ro_paths: &[PathBuf]) -> std::io::Re
     // write-denial: writing into a RO-bound system path must fail.
     let write_denied = !run_wrapped(workspace, ro_paths, "echo probe > /etc/llm-bridge-write-probe 2>/dev/null")?;
 
-    // read-denial: plant a secret in the host temp dir (shadowed by the sandbox tmpfs), then try
-    // to read it from inside the sandbox; it must be invisible.
-    let secret = std::env::temp_dir().join(format!("llm-bridge-canary-{}", std::process::id()));
+    // read-denial: plant the canary OUTSIDE every bound path so the probe targets the SAME denial
+    // the runtime relies on — a secret BESIDE the cred dir (spec §4.8). The runtime RO-binds only the
+    // cred dir itself, so its parent (and any sibling secret) is invisible inside the sandbox. We
+    // plant in the cred dir's parent when known, else `$HOME`, else the temp dir — all unbound.
+    let secret_dir = ro_paths
+        .first()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir);
+    let secret = secret_dir.join(format!("llm-bridge-canary-{}", std::process::id()));
     std::fs::write(&secret, b"TOP-SECRET-CANARY")?;
     let script = format!("cat '{}' 2>/dev/null", secret.display());
     let read_result = run_wrapped(workspace, ro_paths, &script);
