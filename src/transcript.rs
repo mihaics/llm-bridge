@@ -66,7 +66,7 @@ mod tests {
     use crate::openai::{ChatMessage, MessageContent, Role};
 
     fn msg(role: Role, text: &str) -> ChatMessage {
-        ChatMessage { role, content: Some(MessageContent::Text(text.into())), tool_call_id: None }
+        ChatMessage { role, content: Some(MessageContent::Text(text.into())), tool_call_id: None, tool_calls: None }
     }
 
     #[test]

@@ -108,18 +108,18 @@ fn sse_response(
             let (delta, finish) = match ev {
                 AgentEvent::AssistantText(t) => {
                     let role = (!role_sent).then(|| { role_sent = true; "assistant" });
-                    (Some(Delta { role, content: Some(t), reasoning_content: None }), None)
+                    (Some(Delta { role, content: Some(t), reasoning_content: None, tool_calls: None }), None)
                 }
                 AgentEvent::Reasoning(t) | AgentEvent::ToolStart { name: t, .. } | AgentEvent::ToolResult { summary: t } => {
                     match progress {
-                        ProgressChannel::ReasoningContent => (Some(Delta { role: None, content: None, reasoning_content: Some(t) }), None),
+                        ProgressChannel::ReasoningContent => (Some(Delta { role: None, content: None, reasoning_content: Some(t), tool_calls: None }), None),
                         ProgressChannel::Omit => (None, None),
                     }
                 }
                 AgentEvent::Done { finish_reason } => (Some(Delta::default()), Some(finish_reason)),
                 AgentEvent::Error(m) => {
                     // Surface as a final assistant note + stop; SSE has no error frame.
-                    (Some(Delta { role: None, content: Some(format!("[error: {m}]")), reasoning_content: None }), Some("stop".to_string()))
+                    (Some(Delta { role: None, content: Some(format!("[error: {m}]")), reasoning_content: None, tool_calls: None }), Some("stop".to_string()))
                 }
                 AgentEvent::SessionId(_) => (None, None),
             };

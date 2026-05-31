@@ -224,7 +224,7 @@ pub fn response_from_events(
         model: model_id.to_string(),
         choices: vec![Choice {
             index: 0,
-            message: ResponseMessage { role: "assistant", content },
+            message: ResponseMessage { role: "assistant", content, tool_calls: None },
             finish_reason,
         }],
         usage: Usage::default(),
@@ -256,7 +256,7 @@ mod tests {
         RuntimeFingerprint { engine_home: None, sandbox_backend: "none".into() }
     }
     fn umsg(t: &str) -> ChatMessage {
-        ChatMessage { role: Role::User, content: Some(MessageContent::Text(t.into())), tool_call_id: None }
+        ChatMessage { role: Role::User, content: Some(MessageContent::Text(t.into())), tool_call_id: None, tool_calls: None }
     }
     fn req(msgs: Vec<ChatMessage>) -> ChatCompletionRequest {
         ChatCompletionRequest { model: "m".into(), messages: msgs, stream: Some(false), tools: None }
@@ -305,7 +305,7 @@ mod tests {
         assert!(turn.resume.is_none());
         assert!(turn.user_prompt.contains("first"));
         // index advanced: the next turn (history + assistant) must now hit with session id sess-X
-        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("answer one".into())), tool_call_id: None }, umsg("second")];
+        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("answer one".into())), tool_call_id: None, tool_calls: None }, umsg("second")];
         let k = crate::session::lookup_key(&m2, &entry(), None, &rt());
         assert_eq!(store.get(&k), Some("sess-X".to_string()));
     }
@@ -315,7 +315,7 @@ mod tests {
         let store = Arc::new(SessionStore::new());
         let seen = Arc::new(std::sync::Mutex::new(None));
         // Pre-seed the index so the second turn is a hit.
-        let m_prev = [umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("answer one".into())), tool_call_id: None }];
+        let m_prev = [umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("answer one".into())), tool_call_id: None, tool_calls: None }];
         let k = crate::session::lookup_key(&[umsg("first"), m_prev[1].clone(), umsg("second")], &entry(), None, &rt());
         store.insert(k, "sess-prev".into());
         let runner: Arc<dyn TurnRunner> = Arc::new(FakeRunner {
@@ -344,7 +344,7 @@ mod tests {
         let _ = run_request(runner, store.clone(), &agy, &req(messages), &rt()).collect::<Vec<_>>().await;
         assert!(seen.lock().unwrap().clone().unwrap().resume.is_none());
         // Even after a SessionId event, a non-resume engine stores nothing.
-        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None }, umsg("second")];
+        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None, tool_calls: None }, umsg("second")];
         assert_eq!(store.get(&crate::session::lookup_key(&m2, &agy, None, &rt())), None);
     }
 
@@ -364,7 +364,7 @@ mod tests {
         let messages = vec![umsg("first")];
         let _ = run_request(runner, store.clone(), &codex_text, &req(messages), &rt()).collect::<Vec<_>>().await;
         assert!(seen.lock().unwrap().clone().unwrap().resume.is_none());
-        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None }, umsg("second")];
+        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None, tool_calls: None }, umsg("second")];
         assert_eq!(store.get(&crate::session::lookup_key(&m2, &codex_text, None, &rt())), None);
     }
 }

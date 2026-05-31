@@ -45,6 +45,8 @@ pub struct ChatMessage {
     pub content: Option<MessageContent>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
@@ -53,6 +55,25 @@ impl ChatMessage {
         self.content.as_ref().map(|c| c.flatten()).unwrap_or_default()
     }
 }
+
+/// An assistant tool call (OpenAI function-calling). `arguments` is a JSON-encoded string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String, // "function"
+    pub function: FunctionCall,
+}
+
+/// The called function. `arguments` is a JSON-encoded **string** (OpenAI's wire shape), not a
+/// structured value — pass it through verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+fn function_kind() -> String { "function".to_string() }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -98,6 +119,8 @@ pub struct Choice {
 pub struct ResponseMessage {
     pub role: &'static str, // "assistant"
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -133,6 +156,29 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+/// A streaming tool-call delta. `function` is always present (per OpenAI's schema); our bridge
+/// emits a complete call in a single delta, so it always carries both `name` and `arguments`
+/// (we never produce an empty `function: {}`).
+#[derive(Debug, Clone, Serialize)]
+pub struct DeltaToolCall {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>, // "function"
+    pub function: DeltaFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeltaFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 // ---- Error (OpenAI shape) ----
@@ -189,5 +235,53 @@ mod tests {
         let e = ApiError::new("nope", "invalid_request_error");
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(s, r#"{"error":{"message":"nope","type":"invalid_request_error"}}"#);
+    }
+
+    #[test]
+    fn parses_tool_result_followup_with_assistant_tool_calls() {
+        // A follow-up: assistant message carrying tool_calls, then a role:"tool" result.
+        let json = r#"{"model":"m","messages":[
+            {"role":"user","content":"do it"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_abc","type":"function","function":{"name":"search","arguments":"{\"q\":\"x\"}"}}]},
+            {"role":"tool","tool_call_id":"call_abc","content":"result text"}
+        ]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let asst = &req.messages[1];
+        let calls = asst.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "search");
+        assert_eq!(calls[0].function.arguments, r#"{"q":"x"}"#);
+        let tool = &req.messages[2];
+        assert_eq!(tool.role, Role::Tool);
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(tool.text(), "result text");
+    }
+
+    #[test]
+    fn serializes_tool_calls_in_response_message() {
+        let msg = ResponseMessage {
+            role: "assistant",
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(), kind: "function".into(),
+                function: FunctionCall { name: "edit".into(), arguments: "{}".into() },
+            }]),
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""tool_calls":[{"id":"call_1","type":"function","function":{"name":"edit","arguments":"{}"}}]"#), "{s}");
+        // No tool_calls -> field omitted.
+        let plain = ResponseMessage { role: "assistant", content: "hi".into(), tool_calls: None };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("tool_calls"));
+    }
+
+    #[test]
+    fn serializes_delta_tool_call() {
+        let d = Delta { role: None, content: None, reasoning_content: None, tool_calls: Some(vec![DeltaToolCall {
+            index: 0, id: Some("call_1".into()), kind: Some("function"),
+            function: DeltaFunctionCall { name: Some("edit".into()), arguments: Some("{}".into()) },
+        }])};
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains(r#""tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"{}"}}]"#), "{s}");
     }
 }

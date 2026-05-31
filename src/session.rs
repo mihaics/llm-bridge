@@ -40,7 +40,8 @@ impl SessionStore {
 }
 
 /// Canonical projection of a message list: role + flattened content per message, newline-joined.
-/// (Phase 2 has no client-supplied tool_calls; Phase 4 will extend this with tool_call ids.)
+/// (`tool_calls` are intentionally NOT folded into the key yet; Phase 4b extends this with the
+/// normalized tool_call ids/args once the bridge produces them.)
 fn project(messages: &[ChatMessage]) -> String {
     messages
         .iter()
@@ -92,6 +93,7 @@ pub fn stored_key_after(messages: &[ChatMessage], assistant_text: &str, entry: &
         role: Role::Assistant,
         content: Some(crate::openai::MessageContent::Text(assistant_text.to_string())),
         tool_call_id: None,
+        tool_calls: None,
     });
     key_for(&extended, entry, system_prompt, rt)
 }
@@ -110,7 +112,7 @@ mod tests {
         RuntimeFingerprint { engine_home: Some("/cred".into()), sandbox_backend: "none".into() }
     }
     fn msg(role: Role, t: &str) -> ChatMessage {
-        ChatMessage { role, content: Some(MessageContent::Text(t.into())), tool_call_id: None }
+        ChatMessage { role, content: Some(MessageContent::Text(t.into())), tool_call_id: None, tool_calls: None }
     }
 
     #[test]
