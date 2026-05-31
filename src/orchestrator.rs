@@ -75,6 +75,7 @@ pub fn turn_from_request(req: &ChatCompletionRequest, entry: &ModelEntry) -> Tur
         model: entry.model.clone(),
         workspace: entry.workspace.clone(),
         mode: entry.mode,
+        resume: None,
     }
 }
 
@@ -90,7 +91,10 @@ pub fn response_from_events(
             AgentEvent::AssistantText(t) => content.push_str(&t),
             AgentEvent::Done { finish_reason: fr } => finish_reason = fr,
             AgentEvent::Error(m) => return Err(EngineError::Reported(m)),
-            AgentEvent::SessionId(_) => {} // captured by the session store in Phase 2
+            AgentEvent::Reasoning(_)
+            | AgentEvent::ToolStart { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::SessionId(_) => {}
         }
     }
     Ok(ChatCompletionResponse {

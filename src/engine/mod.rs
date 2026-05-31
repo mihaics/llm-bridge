@@ -3,24 +3,37 @@
 pub mod claude;
 
 use crate::config::Mode;
+use futures::Stream;
 use std::path::PathBuf;
+use std::pin::Pin;
 use thiserror::Error;
+
+/// A boxed, owned stream of normalized engine events.
+pub type EventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
 
 /// A normalized unit of work handed to an adapter to build its CLI invocation.
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub system_prompt: Option<String>,
-    /// The user-facing prompt to feed (Phase 1: full read-only transcript replay).
+    /// The user-facing prompt to feed (a single new turn on resume, or the full transcript on a miss).
     pub user_prompt: String,
     pub model: Option<String>,
     pub workspace: Option<PathBuf>,
     pub mode: Mode,
+    /// `Some(session_id)` to resume an existing claude session; `None` for a fresh session.
+    pub resume: Option<String>,
 }
 
-/// Normalized engine output events (Phase 1 subset; ToolStart/ToolResult/ToolCall in Phases 2/4).
+/// Normalized engine output events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     AssistantText(String),
+    /// Model reasoning ("thinking") — routed to the progress channel, never to `content`.
+    Reasoning(String),
+    /// A tool the agent started (agentic mode) — progress channel.
+    ToolStart { name: String, args: String },
+    /// A tool result the agent received — progress channel.
+    ToolResult { summary: String },
     SessionId(String),
     Error(String),
     Done { finish_reason: String },
@@ -77,16 +90,28 @@ mod tests {
     fn claude_caps() {
         let e = Engine::Claude(crate::engine::claude::ClaudeAdapter::new("claude", None));
         let c = e.caps();
-        assert!(c.streaming);          // claude supports stream-json (used in Phase 2)
+        assert!(c.streaming);
         assert!(c.resume_by_id);
-        assert!(!c.mcp_tools_phase1);  // MCP bridge is Phase 4
+        assert!(!c.mcp_tools_phase1);
     }
 
     #[test]
     fn agent_event_variants_construct() {
         let _ = AgentEvent::AssistantText("hi".into());
+        let _ = AgentEvent::Reasoning("thinking".into());
+        let _ = AgentEvent::ToolStart { name: "Edit".into(), args: "{}".into() };
+        let _ = AgentEvent::ToolResult { summary: "ok".into() };
         let _ = AgentEvent::SessionId("sid".into());
         let _ = AgentEvent::Error("boom".into());
         let _ = AgentEvent::Done { finish_reason: "stop".into() };
+    }
+
+    #[test]
+    fn turn_has_resume_field() {
+        let t = Turn {
+            system_prompt: None, user_prompt: "x".into(), model: None,
+            workspace: None, mode: crate::config::Mode::Text, resume: Some("sid".into()),
+        };
+        assert_eq!(t.resume.as_deref(), Some("sid"));
     }
 }

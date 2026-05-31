@@ -18,6 +18,7 @@ async fn claude_text_mode_returns_text() {
         model: Some("sonnet".into()),
         workspace: None,
         mode: Mode::Text,
+        resume: None,
     };
     let passthrough: Vec<String> =
         ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER"].iter().map(|s| s.to_string()).collect();

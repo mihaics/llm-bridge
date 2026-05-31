@@ -122,6 +122,7 @@ mod tests {
             model: Some("opus".into()),
             workspace: ws.map(PathBuf::from),
             mode,
+            resume: None,
         }
     }
 
