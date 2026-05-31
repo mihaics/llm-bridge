@@ -109,10 +109,19 @@ impl McpServer {
     pub async fn start(defs: Vec<ToolDef>) -> std::io::Result<Self> {
         let (calls_tx, calls) = mpsc::unbounded_channel::<PendingToolCall>();
         let template = McpBridge::new(defs, calls_tx);
+        // Stateless + json_response: each POST is an independent request/response with a direct
+        // `application/json` body and NO standalone `text/event-stream` GET. The default stateful
+        // mode opens a server→client SSE stream that claude's HTTP transport aborts immediately
+        // ("SSE stream disconnected" → terminal error → tools never reach the model). A long-running
+        // tool call still parks correctly: `call_tool` awaits its `oneshot`, holding the POST open
+        // until we deliver the result, so the held-open mechanic is unaffected.
+        let config = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true);
         let service = StreamableHttpService::new(
             move || Ok(template.clone()),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            config,
         );
         let app = axum::Router::new().nest_service("/mcp", service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

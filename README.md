@@ -24,12 +24,13 @@ Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_to
   drops the `trusted_caller_only` requirement. Bind localhost; front with a trusted proxy if remote.
   Non-loopback binds require a strong, non-default token.
 
-## Status (Phase 4a)
+## Status (Phase 4b)
 - ✅ `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` — streaming (SSE) and non-streaming
-- ✅ Three engines: `claude` (stream-json), `codex` (`exec --json`), `agy` (`--print`); session resume for claude+codex; bubblewrap sandbox + startup canary probes
-- ✅ **OpenAI `tools` protocol core**: `tool_calls` out (aggregate + SSE `delta.tool_calls`), tool-result follow-up **routing by message shape**, and the **suspended tool-call registry** (turn-level groups: all-or-`409`, duplicate/unknown→`400`, idle-reap, `max_suspended_sessions`→`503`)
-- ⛔ The **live MCP bridge** (in-process `rmcp` server + claude `--mcp-config` wiring) lands in **Phase 4b** — until then `tools` to claude → `400 "Phase 4b"`; `tools` to codex/agy → `400 "not supported for engine …"` (codex gated pending the §9 spike; agy never)
-- ⛔ `sandbox_backend: container` → refused at startup (not yet implemented)
+- ✅ Three engines; session resume (claude+codex); bubblewrap sandbox + canary probes
+- ✅ **OpenAI `tools` end-to-end for claude**: an in-process `rmcp` MCP server exposes the request's tools, claude is wired per-invocation via `--mcp-config <temp> --strict-mcp-config`, tool calls become OpenAI `tool_calls` (`finish_reason:"tool_calls"`), and the client's tool-result follow-up resumes the held-open turn (suspended-session registry: all-or-`409`, duplicate/unknown→`400`, idle-reap, `max_suspended_sessions`→`503`, active-permit released while parked)
+  - The MCP server runs in **stateless `json_response` mode** (`StreamableHttpServerConfig::with_stateful_mode(false).with_json_response(true)`): claude's HTTP MCP client aborts the default stateful server→client SSE stream immediately, which drops the tool list before the model sees it. Stateless request/response avoids the standalone SSE entirely; a long-running tool call still parks (the `tools/call` POST is held open until the result is delivered).
+- ⛔ `tools` to codex/agy → `400 "not supported for engine …"` (codex gated pending the §9 injection spike; agy never)
+- ⛔ `tools` + an external `sandbox_backend` → refused (the tools turn spawns claude unsandboxed; wrapping while keeping the temp `--mcp-config` reachable is future work); `sandbox_backend: container` → refused at startup
 
 ## Test
 ```bash
