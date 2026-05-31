@@ -122,6 +122,7 @@ fn sse_response(
                     (Some(Delta { role: None, content: Some(format!("[error: {m}]")), reasoning_content: None, tool_calls: None }), Some("stop".to_string()))
                 }
                 AgentEvent::SessionId(_) => (None, None),
+                AgentEvent::ToolCall { .. } => (None, None), // mapped to tool_calls in a later task
             };
             if let Some(delta) = delta {
                 let chunk = ChatCompletionChunk {

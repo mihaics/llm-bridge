@@ -214,6 +214,7 @@ pub fn response_from_events(
             AgentEvent::Reasoning(_)
             | AgentEvent::ToolStart { .. }
             | AgentEvent::ToolResult { .. }
+            | AgentEvent::ToolCall { .. }
             | AgentEvent::SessionId(_) => {}
         }
     }

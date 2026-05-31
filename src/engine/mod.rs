@@ -41,6 +41,8 @@ pub enum AgentEvent {
     ToolStart { name: String, args: String },
     /// A tool result the agent received — progress channel.
     ToolResult { summary: String },
+    /// The agent invoked a client tool via the MCP bridge — becomes an OpenAI `tool_call` (Phase 4).
+    ToolCall { id: String, name: String, args: String },
     SessionId(String),
     Error(String),
     Done { finish_reason: String },
@@ -50,8 +52,9 @@ pub enum AgentEvent {
 pub struct Caps {
     pub streaming: bool,
     pub resume_by_id: bool,
-    /// Per-invocation MCP tool injection safe? Always false in Phase 1 (bridge = Phase 4).
-    pub mcp_tools_phase1: bool,
+    /// Per-invocation MCP tool injection safe? claude: true (--mcp-config --strict-mcp-config);
+    /// codex: false (gated pending the §9 spike); agy: false (no per-invocation MCP config).
+    pub mcp_tools: bool,
 }
 
 #[derive(Debug, Error)]
@@ -67,9 +70,9 @@ pub enum EngineError {
 /// until the §9 spike proves session-id capture + credential isolation.
 pub fn caps_for(engine: EngineKind) -> Caps {
     match engine {
-        EngineKind::Claude => Caps { streaming: true, resume_by_id: true, mcp_tools_phase1: false },
-        EngineKind::Codex => Caps { streaming: true, resume_by_id: true, mcp_tools_phase1: false },
-        EngineKind::Agy => Caps { streaming: false, resume_by_id: false, mcp_tools_phase1: false },
+        EngineKind::Claude => Caps { streaming: true, resume_by_id: true, mcp_tools: true },
+        EngineKind::Codex => Caps { streaming: true, resume_by_id: true, mcp_tools: false },
+        EngineKind::Agy => Caps { streaming: false, resume_by_id: false, mcp_tools: false },
     }
 }
 
@@ -123,7 +126,7 @@ mod tests {
         let c = e.caps();
         assert!(c.streaming);
         assert!(c.resume_by_id);
-        assert!(!c.mcp_tools_phase1);
+        assert!(c.mcp_tools);
     }
 
     #[test]
@@ -135,6 +138,19 @@ mod tests {
         let _ = AgentEvent::SessionId("sid".into());
         let _ = AgentEvent::Error("boom".into());
         let _ = AgentEvent::Done { finish_reason: "stop".into() };
+    }
+
+    #[test]
+    fn tool_call_event_constructs() {
+        let _ = AgentEvent::ToolCall { id: "call_1".into(), name: "search".into(), args: "{}".into() };
+    }
+
+    #[test]
+    fn mcp_tools_caps_claude_only() {
+        use crate::config::EngineKind;
+        assert!(caps_for(EngineKind::Claude).mcp_tools);   // claude: per-invocation --mcp-config (safe)
+        assert!(!caps_for(EngineKind::Codex).mcp_tools);   // gated pending the §9 injection spike
+        assert!(!caps_for(EngineKind::Agy).mcp_tools);     // no per-invocation MCP config at all
     }
 
     #[test]
@@ -151,11 +167,11 @@ mod tests {
     fn caps_per_engine() {
         use crate::config::EngineKind;
         let claude = caps_for(EngineKind::Claude);
-        assert!(claude.streaming && claude.resume_by_id && !claude.mcp_tools_phase1);
+        assert!(claude.streaming && claude.resume_by_id && claude.mcp_tools);
         let codex = caps_for(EngineKind::Codex);
-        assert!(codex.streaming && codex.resume_by_id && !codex.mcp_tools_phase1);
+        assert!(codex.streaming && codex.resume_by_id && !codex.mcp_tools);
         let agy = caps_for(EngineKind::Agy);
-        assert!(!agy.streaming && !agy.resume_by_id && !agy.mcp_tools_phase1); // non-streaming, resume gated off
+        assert!(!agy.streaming && !agy.resume_by_id && !agy.mcp_tools); // non-streaming, resume gated off
     }
 
     #[test]
