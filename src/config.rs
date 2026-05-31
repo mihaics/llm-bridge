@@ -81,6 +81,18 @@ pub struct ModelEntry {
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind { Claude, Codex, Agy }
 
+impl EngineKind {
+    /// Canonical lowercase name (matches `rename_all = "lowercase"` and the config YAML), for
+    /// operator-facing messages — avoids leaking the PascalCase `Debug` form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EngineKind::Claude => "claude",
+            EngineKind::Codex => "codex",
+            EngineKind::Agy => "agy",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode { Agentic, Text }
@@ -88,6 +100,18 @@ pub enum Mode { Agentic, Text }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxBackend { #[default] None, Bubblewrap, Container }
+
+impl SandboxBackend {
+    /// Canonical lowercase name (matches `rename_all = "lowercase"`); used for the session-key
+    /// runtime fingerprint, which must stay stable against future enum renames.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxBackend::None => "none",
+            SandboxBackend::Bubblewrap => "bubblewrap",
+            SandboxBackend::Container => "container",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]

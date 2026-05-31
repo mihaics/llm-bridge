@@ -1,5 +1,5 @@
-//! Startup validation. Returns Err(Vec<message>) listing every problem (so the operator sees all
-//! issues at once). Phase 1 enforces the rules it owns; Phase 3 adds the sandbox canary probes.
+//! Startup validation. Returns Err(Vec<message>) listing every problem at once. Phase 3 allows all
+//! three engines + the bubblewrap sandbox; the real write/read canary probes run at startup in main.
 use crate::config::{Config, EngineKind, Mode, SandboxBackend};
 use std::path::{Path, PathBuf};
 
@@ -26,13 +26,13 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
         }
     }
 
-    // Phase-1 ceiling: only `none` sandbox backend is implemented.
-    if cfg.defaults.sandbox_backend != SandboxBackend::None {
-        errs.push(format!(
-            "defaults.sandbox_backend={:?} is not implemented in Phase 1 (use `none`; sandbox backends arrive in Phase 3)",
-            cfg.defaults.sandbox_backend
-        ));
+    // bubblewrap is implemented; container is not yet (the enum value stays valid in config).
+    if cfg.defaults.sandbox_backend == SandboxBackend::Container {
+        errs.push(
+            "defaults.sandbox_backend=container is not yet implemented; use `bubblewrap` or `none`".to_string(),
+        );
     }
+    let sandboxed = cfg.defaults.sandbox_backend != SandboxBackend::None;
 
     let cred_dirs: Vec<PathBuf> = [
         cfg.credentials.claude_config_dir.clone(),
@@ -44,22 +44,32 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
     .collect();
 
     for m in &cfg.models {
-        if m.engine != EngineKind::Claude {
-            errs.push(format!(
-                "model '{}': only the claude engine is implemented in Phase 1 (got {:?})",
-                m.id, m.engine
-            ));
-        }
+        // (All three engines are supported in Phase 3 — no engine refusal here.)
 
         if m.mode == Mode::Agentic {
-            if !m.trusted_caller_only {
+            if !sandboxed && !m.trusted_caller_only {
                 errs.push(format!(
-                    "model '{}': agentic models require trusted_caller_only: true when sandbox_backend is none",
+                    "model '{}': agentic models require trusted_caller_only: true when sandbox_backend is none (no native sandbox passes the read-denial probe)",
                     m.id
                 ));
             }
             if m.workspace.is_none() {
                 errs.push(format!("model '{}': agentic models require a workspace", m.id));
+            }
+            // API-key env auth leaks into model-run tool shells for claude/agy (only codex scrubs);
+            // disallow it for those engines unless an external sandbox contains the leak.
+            if !sandboxed && matches!(m.engine, EngineKind::Claude | EngineKind::Agy) {
+                let leaked: Vec<&str> = api_key_vars(m.engine)
+                    .iter()
+                    .copied()
+                    .filter(|k| cfg.defaults.env_passthrough.iter().any(|p| p == k))
+                    .collect();
+                if !leaked.is_empty() {
+                    errs.push(format!(
+                        "model '{}': API-key env auth ({}) is disallowed for a {} agentic model without a sandbox_backend (it leaks to model-run tool shells); use file-based login or set sandbox_backend",
+                        m.id, leaked.join(", "), m.engine.as_str()
+                    ));
+                }
             }
         }
 
@@ -77,6 +87,16 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
     }
 
     if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// API-key env vars that leak into model-run tool shells. codex scrubs via shell_environment_policy
+/// (so it is exempt); claude/agy expose no equivalent.
+fn api_key_vars(engine: EngineKind) -> &'static [&'static str] {
+    match engine {
+        EngineKind::Claude => &["ANTHROPIC_API_KEY"],
+        EngineKind::Agy => &["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+        EngineKind::Codex => &[],
+    }
 }
 
 fn is_loopback_bind(bind: &str) -> bool {
@@ -116,6 +136,12 @@ mod tests {
     fn agentic(ws: &str, trusted: bool) -> ModelEntry {
         ModelEntry { id: "a".into(), engine: EngineKind::Claude, model: Some("opus".into()),
             workspace: Some(PathBuf::from(ws)), mode: Mode::Agentic, permissions: None,
+            trusted_caller_only: trusted }
+    }
+
+    fn codex_agentic(ws: &str, trusted: bool) -> ModelEntry {
+        ModelEntry { id: "c".into(), engine: EngineKind::Codex, model: Some("gpt-5".into()),
+            workspace: Some(PathBuf::from(ws)), mode: Mode::Agentic, permissions: Some("workspace-write".into()),
             trusted_caller_only: trusted }
     }
 
@@ -165,22 +191,67 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_backend_other_than_none_is_refused_in_phase1() {
+    fn codex_and_agy_engines_are_allowed() {
         let mut cfg = base();
-        cfg.defaults.sandbox_backend = SandboxBackend::Bubblewrap;
-        cfg.models = vec![agentic("/work/repoA", true)];
-        let err = validate_config(&cfg).unwrap_err();
-        assert!(err.iter().any(|m| m.contains("sandbox_backend")), "{err:?}");
+        cfg.models = vec![
+            ModelEntry { id: "ct".into(), engine: EngineKind::Codex, model: None, workspace: None,
+                mode: Mode::Text, permissions: None, trusted_caller_only: false },
+            ModelEntry { id: "at".into(), engine: EngineKind::Agy, model: None, workspace: None,
+                mode: Mode::Text, permissions: None, trusted_caller_only: false },
+        ];
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
     }
 
     #[test]
-    fn non_claude_engine_is_refused_in_phase1() {
+    fn codex_agentic_without_trusted_and_no_sandbox_is_refused() {
         let mut cfg = base();
-        cfg.models = vec![ModelEntry { id: "c".into(), engine: EngineKind::Codex,
-            model: None, workspace: None, mode: Mode::Text, permissions: None,
-            trusted_caller_only: false }];
+        cfg.models = vec![codex_agentic("/work/repoB", false)];
         let err = validate_config(&cfg).unwrap_err();
-        assert!(err.iter().any(|m| m.contains("only the claude engine")), "{err:?}");
+        assert!(err.iter().any(|m| m.contains("trusted_caller_only")), "{err:?}");
+    }
+
+    #[test]
+    fn bubblewrap_backend_is_allowed_and_drops_trusted_requirement() {
+        let mut cfg = base();
+        cfg.defaults.sandbox_backend = SandboxBackend::Bubblewrap;
+        cfg.models = vec![agentic("/work/repoA", false)]; // not trusted, but sandboxed -> OK
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
+    }
+
+    #[test]
+    fn container_backend_is_refused_as_not_implemented() {
+        let mut cfg = base();
+        cfg.defaults.sandbox_backend = SandboxBackend::Container;
+        cfg.models = vec![agentic("/work/repoA", true)];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.iter().any(|m| m.contains("container") && m.contains("not yet implemented")), "{err:?}");
+    }
+
+    #[test]
+    fn claude_agentic_with_api_key_env_and_no_sandbox_is_refused() {
+        let mut cfg = base();
+        cfg.defaults.env_passthrough = vec!["PATH".into(), "ANTHROPIC_API_KEY".into()];
+        cfg.models = vec![agentic("/work/repoA", true)];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.iter().any(|m| m.contains("API-key env")), "{err:?}");
+    }
+
+    #[test]
+    fn codex_agentic_with_api_key_env_is_allowed() {
+        // codex scrubs via shell_environment_policy, so env-key auth is fine for it.
+        let mut cfg = base();
+        cfg.defaults.env_passthrough = vec!["PATH".into(), "OPENAI_API_KEY".into()];
+        cfg.models = vec![codex_agentic("/work/repoB", true)];
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
+    }
+
+    #[test]
+    fn claude_api_key_env_with_bubblewrap_is_allowed() {
+        let mut cfg = base();
+        cfg.defaults.sandbox_backend = SandboxBackend::Bubblewrap;
+        cfg.defaults.env_passthrough = vec!["PATH".into(), "ANTHROPIC_API_KEY".into()];
+        cfg.models = vec![agentic("/work/repoA", false)];
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
     }
 
     #[test]

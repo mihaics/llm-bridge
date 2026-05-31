@@ -78,7 +78,7 @@ async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCom
         EngineKind::Codex => state.credentials.codex_home.clone(),
         EngineKind::Agy => state.credentials.agy_config_dir.clone(),
     };
-    let rt = runtime_fingerprint(&engine_home, &format!("{:?}", state.defaults.sandbox_backend).to_lowercase());
+    let rt = runtime_fingerprint(&engine_home, state.defaults.sandbox_backend.as_str());
     let events = run_request(state.runner.clone(), state.sessions.clone(), &entry, &req, &rt);
 
     if streaming {
