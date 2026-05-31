@@ -96,6 +96,26 @@ Consequences baked into the design:
   profiles** — it does not persist session files, so resumable runs instead use a dedicated
   persistent `CODEX_HOME` (§4.8).
 
+### 3.3 The trust model (single-user / trusted) — and why session isolation is content-only
+`llm-bridge` v1 targets a **single-user or trusted-LAN deployment** (the PoC's model). This is a
+deliberate scope decision with direct consequences:
+
+- **Cross-user session isolation is out of scope.** Because OpenWebUI strips `user`/`chat_id`
+  (§3.1), the session key is content-derived; two *different* users issuing the same model with
+  the same projected history would map to the same `key → cli sid` and could cross-resume each
+  other's native session. Under the single-user model there is one trusted caller, so this is a
+  non-issue **by design** — but it is called out so the limitation is explicit. Multi-tenant use
+  is **not supported** without future work (a trusted reverse-proxy identity header namespacing
+  the key is the intended hook, left as a documented extension point, not built in v1).
+- **claude/agy agentic models are trusted-caller-only.** Per §4.8, their auto-approve does not
+  OS-confine spawned shell tools, so without an external OS sandbox a caller could read the
+  credential dir. Under the trusted model this is **accepted and documented**, not enforced
+  away; an optional `sandbox_backend` (§6) is offered for defense-in-depth but not required in
+  single-user mode. Codex `workspace-write` remains a real boundary regardless.
+
+The deployment docs must state the trusted-use assumption prominently (bind localhost, front
+with a trusted proxy if remote).
+
 ## 4. Architecture
 
 ```
@@ -187,7 +207,7 @@ Per-engine specifics (from §3.2):
 - **Agy** → `--print` (plain text, non-streaming), `--add-dir <workspace>`, `--sandbox`
   (boolean). Emits a single `AssistantText` + `Done`; `caps().streaming == false`. agy exposes
   **no** config-dir / MCP / profile flag, so it has **no safe per-invocation MCP config**:
-  **MCP/`tools` is gated OFF for agy** (`caps().tools == false`). `--conversation <id>` resume
+  **MCP/`tools` is gated OFF for agy** (`caps().mcp_tools == false`). `--conversation <id>` resume
   and credential/config isolation are likewise **unproven** and gated behind the §9 agy spike;
   until proven, agy runs stateless replay with the operator-provided login only.
 
@@ -210,8 +230,12 @@ Tool activity is routed by the configured **client profile** (`progress_channel`
 `reasoning_content` is an OpenWebUI/DeepSeek convention, **not** part of the strict OpenAI Chat
 Completions schema:
 - `reasoning_content` (default, OpenWebUI): progress streams as `delta.reasoning_content`, which
-  OpenWebUI renders (collapsible) but does **not** persist into the resent history — keeping the
-  replayed conversation and the content-hash free of synthetic progress text.
+  OpenWebUI renders as collapsible reasoning. The correctness guarantee is the part **we**
+  control: reasoning is **excluded from our session-hash projection and omitted from our miss-path
+  replay** (§4.5), so synthetic progress never affects resume regardless of what the client does.
+  How OpenWebUI stores/resends structured reasoning is provider-setting dependent (it keeps it
+  separately, not as plain assistant content); the deployment docs specify the required OpenWebUI
+  provider setting so reasoning isn't fed back as instructions.
 - `omit` (strict OpenAI clients): only standard chunks (`content`, `tool_calls`) are emitted;
   progress is suppressed so we never put non-standard fields on the wire or pollute `content`.
 
@@ -263,23 +287,32 @@ When a request carries `tools`:
    **never mutates a shared config file**, so concurrent requests can't overwrite each other's
    wiring, point an agent at the wrong tool server, or leave stale entries (the per-request
    temp file is deleted on turn end).
-2. When the agent calls one, the bridge emits an OpenAI `tool_call` (with a generated
-   `tool_call_id`) and **ends the turn** with `finish_reason: "tool_calls"`.
-3. OpenAI's protocol means the client executes the tool and returns the result in a **follow-up
-   request** containing the assistant message with that `tool_calls` entry **and** a
-   `role:"tool"` message carrying the matching **`tool_call_id`** — *not* a new user turn.
+2. When the agent calls one or more tools, the bridge emits the corresponding OpenAI
+   `tool_call`s (each with a generated `tool_call_id`) in the assistant turn and **ends the
+   turn** with `finish_reason: "tool_calls"`. An agent may issue several MCP calls before
+   yielding, so a turn can carry **multiple** `tool_call`s.
+3. OpenAI's protocol means the client executes the tools and returns results in a **follow-up
+   request** containing the assistant message with those `tool_calls` **and** one
+   `role:"tool"` message per call carrying the matching **`tool_call_id`** — *not* a new user
+   turn. Results for multiple calls may arrive together or be split across requests.
 
-**Suspended-session mechanism, keyed by `tool_call_id`:** the process that hit a
-client tool call is **held open** (with its parked MCP call) in a `SuspendedSessions` registry
-keyed by the emitted **`tool_call_id`(s)**. The orchestrator (§4.3 step 2) detects a follow-up
-by matching the request's `tool` messages' `tool_call_id`s against this registry — *not* by the
-conversation prefix hash, which would not match because the follow-up adds tool/assistant
-messages rather than a user turn. On match, it delivers the `tool` result into the waiting MCP
-call and the same process continues. A timeout reaps orphaned suspensions (client never returns
-the result, or retries instead) by killing the child; the next turn then starts fresh.
+**Suspended-session mechanism — turn-level group keyed by `tool_call_id`s:** the process that
+hit client tool calls is **held open** in a `SuspendedSessions` registry as a **group**
+recording *all* outstanding `tool_call_id`s for that turn, each with its own **parked MCP call**.
+The orchestrator (§4.3 step 2) routes a follow-up by matching the request's `role:"tool"`
+`tool_call_id`s against the group. Handling rules:
+- **Per-result delivery:** each arriving `tool` result is delivered into the MCP call parked on
+  its `tool_call_id`; the agent process unblocks each call independently.
+- **Resume-when-complete:** the process resumes/streams forward only once **all** outstanding
+  ids in the group have results — partial follow-ups are accepted and the group waits for the
+  rest.
+- **Duplicate result** for an already-satisfied id → ignored (idempotent) with a warning log.
+- **Unknown id** (no matching parked call) → OpenAI `400` error.
+- **Orphan timeout:** if the full set never arrives (client abandons or retries), the suspension
+  is reaped and the child killed; the next turn starts fresh.
 
 This is the only place a process outlives a single HTTP request: bounded (only with `tools`),
-keyed by `tool_call_id`, and time-limited.
+keyed by the turn's `tool_call_id` group, and time-limited.
 
 ### 4.7 Process Supervisor
 Spawns child CLIs via `tokio::process`; per-turn timeouts (→ `504`); a global concurrency cap
@@ -329,6 +362,12 @@ file edits and command execution, the boundary is hardened on multiple axes:
   The config's `permissions` maps to the strongest available control per engine; the docs state
   each engine's actual guarantee (the sandbox strength is the *engine's* — or the host OS's —
   not ours).
+- **Startup validation ties config to posture.** A claude/agy model with `mode: agentic` and no
+  `sandbox_backend` configured (§6) starts **only** if it is explicitly marked
+  `trusted_caller_only: true`; otherwise the server refuses to start with a clear message. This
+  prevents the config from *implying* confinement that isn't there. When a `sandbox_backend`
+  (bubblewrap/namespace/container) is configured, the engine runs inside it and the flag isn't
+  required. Codex `workspace-write` is self-confining and needs neither.
 - **`mode: text`** replicates the PoC: empty temp dir, all tools blocked — a safe pure-generator.
 
 ## 5. Data flow
@@ -362,6 +401,8 @@ defaults:
   max_concurrency: 4
   session_store: { backend: sled, path: ~/.llm-bridge/sessions, ttl_h: 24 }
   env_passthrough: ["PATH", "LANG"]    # everything else scrubbed from spawned CLIs
+  sandbox_backend: none                # none | bubblewrap | container — required for claude/agy
+                                       # agentic unless that model sets trusted_caller_only: true
 credentials:                    # dedicated, persistent, operator-provisioned per-engine dirs
   claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR
   codex_home: ~/.llm-bridge/cred/codex           # CODEX_HOME (persistent — enables resume)
@@ -374,6 +415,8 @@ models:
     workspace: /work/repoA       # canonicalized; symlink-escapes rejected
     mode: agentic                # agentic | text
     permissions: workspace-write # mapped to the strongest equivalent per engine
+    trusted_caller_only: true    # REQUIRED for claude/agy agentic when sandbox_backend: none
+                                 # (their auto-approve doesn't OS-confine spawned shell tools)
   - id: "codex-gpt5-repoB"
     engine: codex
     model: gpt-5
@@ -418,7 +461,8 @@ everything else.
   not CI).
 
 ## 9. Build sequence (ordered, all in v1)
-1. Scaffold, config loader, model registry, `/health` + `/v1/models`, localhost bind + auth.
+1. Scaffold, config loader, model registry, `/health` + `/v1/models`, localhost bind + auth,
+   **startup validation** (claude/agy agentic ⇒ `sandbox_backend` set or `trusted_caller_only`).
 2. `Engine` enum + `FakeEngine`; Turn Orchestrator; non-streaming `/v1/chat/completions`.
 3. Process Supervisor (spawn, isolation/env scrub, timeout, concurrency, cancellation).
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
@@ -443,8 +487,13 @@ everything else.
   --strict-mcp-config`); **codex `-c mcp_servers.*` per-invocation injection is unvalidated** and
   the §9 spike must confirm it before codex `tools` ships (else gate codex MCP); agy has no safe
   per-invocation MCP config and is gated off.
-- **Suspended-session vs client retry:** if OpenWebUI retries instead of returning the tool
-  result, the suspension times out and the next turn starts fresh (acceptable degradation).
+- **Single-user/trusted is a hard assumption (§3.3):** session keys are content-derived, so a
+  multi-tenant deployment could cross-resume users. v1 does not support multi-tenant use; a
+  trusted-proxy identity header namespacing the key is the documented future extension point.
+- **Suspended-session vs client retry / multi-call:** suspensions are turn-level groups that
+  resume only when all `tool_call_id`s have results; if the client retries or abandons instead of
+  returning the full set, the group times out and the next turn starts fresh (acceptable
+  degradation).
 - **agy spike covers three things:** session-id capture, credential/config isolation (keyring +
   `~/.gemini` may not redirect to a service dir), and confirms MCP-off. If isolation can't be
   proven, agy is operator-login-only / single-tenant in v1.
