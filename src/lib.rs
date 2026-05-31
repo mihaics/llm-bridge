@@ -8,5 +8,6 @@ pub mod registry;
 pub mod routing;
 pub mod sandbox;
 pub mod session;
+pub mod suspend;
 pub mod transcript;
 pub mod validate;
