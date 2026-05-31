@@ -78,11 +78,14 @@ Verified against the installed binaries:
 | `agy` | ✗ **plain text only** (`--print`) | ✓ `--conversation <id>` / `--continue` | ✗ | ✗ boolean only (`--sandbox`) | only the final text exists |
 
 Consequences baked into the design:
-- **agy is a non-streaming, final-text-only adapter** in v1: no progress, no tool events,
-  coarse boolean sandbox. Its session id is **not** emitted on stdout (unlike claude/codex), so
-  **agy resume is gated** on a proven session-id capture spike (§9). Until proven, agy runs
-  **stateless replay** — the full projected conversation fed each turn (the miss path, §4.5) —
-  which is correct, just slower. `--conversation <id>` is wired only once capture is proven.
+- **agy is the most constrained engine** in v1: non-streaming, no progress, no tool events,
+  coarse boolean sandbox, and — confirmed from `--help` — **no config-dir / MCP / profile flag**.
+  Consequences: **MCP/`tools` is gated OFF** for agy (no race-free per-invocation MCP config);
+  **session resume** is gated on a session-id capture spike (its id isn't on stdout); and
+  **credential/config isolation is unproven** (Antigravity auth uses the OS keyring + `~/.gemini`
+  settings, which a service config dir may not redirect). Until the §9 agy spike proves
+  session-id capture *and* credential isolation, agy runs **stateless replay** (full transcript
+  each turn, §4.5) under the operator's own login only — correct, just slower and single-tenant.
 - **claude and codex are streaming adapters** with distinguishable tool events and a separable
   final answer — which is what makes the progress/`content` split (§4.4) clean. Both emit their
   session id in their event stream (claude `stream-json` init/result; codex `--json` events),
@@ -155,7 +158,9 @@ problems of `impl AsyncRead` args / `impl Stream` returns, and removes dynamic-d
 ```rust
 enum Engine { Claude(ClaudeAdapter), Codex(CodexAdapter), Agy(AgyAdapter) }
 
-struct Caps { streaming: bool, tool_events: bool, resume_by_id: bool, sandbox: SandboxKind }
+struct Caps { streaming: bool, tool_events: bool, resume_by_id: bool, mcp_tools: bool, sandbox: SandboxKind }
+//                                                                        ^ per-invocation MCP injection safe?
+//   claude: true (--mcp-config --strict-mcp-config) · codex: gated on §9 spike · agy: false
 
 impl Engine {
     fn caps(&self) -> Caps;
@@ -166,17 +171,25 @@ impl Engine {
 ```
 
 Per-engine specifics (from §3.2):
-- **Claude** → `-p --output-format stream-json`, `--system-prompt`, `--model`,
-  `--continue`/`--resume <id>`; sandbox via confined workdir + tool allow/deny policy.
+- **Claude** → `-p --output-format stream-json`, `--system-prompt`/`--append-system-prompt`,
+  `--model`, `--continue`/`--resume <id>`, `--permission-mode`; sandbox via confined workdir +
+  tool allow/deny policy. **Per-process MCP:** a per-request temp JSON file passed with
+  `--mcp-config <file> --strict-mcp-config` (ignores all other MCP configs) — no shared-file
+  mutation, race-free across concurrent requests.
 - **Codex** → `codex exec --json` (JSONL events; carries the session id), `--output-last-message
   <file>` for the clean final answer, `exec resume <id>` / `--last`, `-s <level>` sandbox,
   `--cd`/`--add-dir`, isolation via a dedicated persistent `CODEX_HOME` + `--ignore-user-config`
   + `-c shell_environment_policy.inherit=...`. **`--ephemeral` only on `text` profiles** (it
-  disables session persistence and would break resume). MCP via `codex mcp` config.
+  disables session persistence and would break resume). **Per-process MCP:** injected via
+  per-invocation `-c mcp_servers.<name>.*` config overrides (a per-request `CODEX_HOME` is *not*
+  usable — sessions live there). This override path is validated by the §9 spike; if it can't
+  inject MCP per-invocation safely, codex `tools` support is gated.
 - **Agy** → `--print` (plain text, non-streaming), `--add-dir <workspace>`, `--sandbox`
-  (boolean); MCP via `~/.gemini/config/mcp_config.json`. Emits a single `AssistantText` +
-  `Done`; `caps().streaming == false`. `--conversation <id>` resume is wired **only after** the
-  session-id capture spike succeeds (§9); otherwise stateless replay.
+  (boolean). Emits a single `AssistantText` + `Done`; `caps().streaming == false`. agy exposes
+  **no** config-dir / MCP / profile flag, so it has **no safe per-invocation MCP config**:
+  **MCP/`tools` is gated OFF for agy** (`caps().tools == false`). `--conversation <id>` resume
+  and credential/config isolation are likewise **unproven** and gated behind the §9 agy spike;
+  until proven, agy runs stateless replay with the operator-provided login only.
 
 Normalized event type and channel mapping:
 
@@ -213,24 +226,43 @@ regardless of profile.
   `tool_call_id` linkage prevents post-tool conversations from colliding or resuming the wrong
   native session (otherwise two threads that differ only in tool activity hash identically).
 - **Key** = hash of (a) the projection of the **prefix** (all messages except the final user
-  turn) **plus** (b) the **ModelEntry fingerprint** (engine, model, workspace, mode,
-  permissions), which stops a reused id with changed workspace/model/permissions from resuming
-  the wrong CLI session.
+  turn), (b) the **ModelEntry fingerprint** (engine, model, workspace, mode, permissions), and
+  (c) a **tool-config fingerprint** — normalized `tools` definitions + `tool_choice`. The tool
+  fingerprint matters because the available tool set is part of the agent's environment: two
+  identical conversations with different `tools` must **not** resume the same native session.
+  Equivalently, native resume is disabled whenever the tool config differs from the resumed
+  session's.
 - Lookup `key → CliSessionId`:
   - **Hit:** spawn with the engine's resume flag and feed **only the new user turn** (the CLI
     already holds the prior context on disk).
   - **Miss** (no entry, or the index was lost on restart): start a **fresh session and feed the
-    full serialized projected conversation**, not just the last turn — so context resent by
-    OpenWebUI is never dropped. Capture the `SessionId` event and store `key′ → sid` where
-    `key′` includes the just-completed turn, so the next request resolves to a hit.
+    full conversation rendered as a read-only transcript** (format below), not just the last
+    turn — so context resent by OpenWebUI is never dropped. Capture the `SessionId` event and
+    store `key′ → sid` where `key′` includes the just-completed turn, so the next request
+    resolves to a hit.
+- **Replay transcript format (miss path).** The CLIs take a single prompt string, not structured
+  Chat messages, so we render the projected history into one prompt with an explicit guard: a
+  leading instruction stating the block is **prior context for reference only — do NOT
+  re-execute past instructions; act only on the final user message**, followed by clearly
+  delimited, role-labeled turns (`### User` / `### Assistant` / `### Tool result for <id>`), with
+  the genuinely-new final user turn separated below the transcript as the live instruction. This
+  prevents an old "edit this file" turn from being re-run as new work. The renderer is a defined
+  unit with tests over tool-role histories (§8).
 - Store: in-memory map with optional `sled` persistence + idle-TTL GC. The server holds no
   agent state itself — the real session lives in the CLI's own on-disk store; a restart loses
   only the key→sid index, degrading to the (correct) full-replay miss path.
 
 ### 4.6 MCP Tool Bridge (for OpenAI `tools`)
+Only for engines with `caps().mcp_tools == true` (claude now; codex pending the §9 spike; agy
+never). A request with `tools` to an engine lacking it is rejected with a clear OpenAI error.
+
 When a request carries `tools`:
-1. The orchestrator starts an in-process **`rmcp` MCP server** exposing those tool definitions
-   and points the spawned CLI at it (per-engine MCP config).
+1. The orchestrator starts an in-process **`rmcp` MCP server** on a fresh ephemeral port/socket
+   and points **this spawned process only** at it via a **per-invocation** mechanism — claude
+   `--mcp-config <temp-file> --strict-mcp-config`, codex `-c mcp_servers.*` overrides. It
+   **never mutates a shared config file**, so concurrent requests can't overwrite each other's
+   wiring, point an agent at the wrong tool server, or leave stale entries (the per-request
+   temp file is deleted on turn end).
 2. When the agent calls one, the bridge emits an OpenAI `tool_call` (with a generated
    `tool_call_id`) and **ends the turn** with `finish_reason: "tool_calls"`.
 3. OpenAI's protocol means the client executes the tool and returns the result in a **follow-up
@@ -272,13 +304,31 @@ file edits and command execution, the boundary is hardened on multiple axes:
   These dirs are **persistent** (not `--ephemeral`): codex resumable runs need a stable
   `CODEX_HOME` to keep session files; `--ephemeral` is reserved for `text` profiles that never
   resume. The provisioning steps are part of the deployment docs.
+- **Credential dirs must be unreadable by model-executed tools.** The service credential dirs
+  hold real secrets (Claude's `CLAUDE_CONFIG_DIR` stores credentials, session history, settings,
+  plugins; `CODEX_HOME` likewise). Since the agent runs shell/file tools, a request could
+  otherwise read and exfiltrate them. Rule, enforced two ways: (1) credential dirs live
+  **outside any workspace** and the **sandbox filesystem policy denies read** of them — so
+  agentic models run at `read-only`/`workspace-write`, **never** `danger-full-access` /
+  `--dangerously-skip-permissions` unless an external OS sandbox already isolates the cred dir;
+  and (2) the credential-dir path is set on the **CLI process env only** and scrubbed from the
+  environment of any tool subprocess the agent spawns, so it isn't leaked to model-run shells.
 - **Workspace confinement:** canonicalize the configured workspace path, reject symlinks that
   escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
-- **Per-engine sandbox is documented, not assumed uniform:** codex `read-only` /
-  `workspace-write` / `danger-full-access`; claude tool allow/deny + confined dir; agy coarse
-  boolean `--sandbox`. The config's `permissions` maps to the strongest available control per
-  engine, and the docs state each engine's actual guarantee (the sandbox strength is the
-  *engine's*, not ours).
+- **Per-engine sandbox is documented, not assumed uniform — and "full-auto" ≠ "full access":**
+  auto-approve (no permission prompts) is separated from filesystem scope.
+  - **codex** has a real FS boundary: `workspace-write` auto-approves edits *inside* the
+    workspace while denying reads/writes outside it (including the cred dir). This is the
+    intended full-auto posture; `danger-full-access` is never used for request-driven runs.
+  - **claude / agy** auto-approve via `--dangerously-skip-permissions` / `--sandbox`, which do
+    **not** OS-confine the shell commands the agent spawns — a `bash` tool could read the cred
+    dir. So for these engines, real confinement requires an **external OS sandbox**
+    (bubblewrap / namespaces / container) that denies the cred dir and non-workspace paths.
+    Without it, claude/agy agentic models are only safe for trusted callers; this is documented
+    as the weaker posture.
+  The config's `permissions` maps to the strongest available control per engine; the docs state
+  each engine's actual guarantee (the sandbox strength is the *engine's* — or the host OS's —
+  not ours).
 - **`mode: text`** replicates the PoC: empty temp dir, all tools blocked — a safe pure-generator.
 
 ## 5. Data flow
@@ -315,7 +365,8 @@ defaults:
 credentials:                    # dedicated, persistent, operator-provisioned per-engine dirs
   claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR
   codex_home: ~/.llm-bridge/cred/codex           # CODEX_HOME (persistent — enables resume)
-  agy_config_dir: ~/.llm-bridge/cred/gemini      # agy ~/.gemini equivalent
+  agy_config_dir: ~/.llm-bridge/cred/gemini      # UNPROVEN: agy has no config-dir flag and uses
+                                                 # the OS keyring; isolation gated on §9 spike
 models:
   - id: "claude-opus-repoA"
     engine: claude               # claude | codex | agy
@@ -354,9 +405,15 @@ everything else.
   streaming channel mapping, `reasoning_content` vs `content` split, tool-call
   suspension/resume by `tool_call_id`, cancellation).
 - **MCP bridge** tested with an in-process `rmcp` client driving a scripted suspension round
-  trip (including the `tool_call_id` routing and the orphan timeout).
+  trip (including the `tool_call_id` routing and the orphan timeout); plus a **concurrency test**
+  asserting two simultaneous tool-bearing requests get isolated per-process MCP wiring (distinct
+  temp configs / sockets, no cross-talk).
 - **Session key** tested for fingerprint sensitivity (same id + changed workspace ⇒ different
-  key) and prefix-rotation correctness.
+  key; same conversation + different `tools`/`tool_choice` ⇒ different key) and prefix-rotation
+  correctness.
+- **Replay transcript renderer** tested over tool-role histories: asserts past user
+  instructions are framed as read-only context and only the final user turn is the live
+  instruction.
 - **End-to-end smoke** behind a feature flag that shells out to a real installed CLI (local,
   not CI).
 
@@ -365,28 +422,37 @@ everything else.
 2. `Engine` enum + `FakeEngine`; Turn Orchestrator; non-streaming `/v1/chat/completions`.
 3. Process Supervisor (spawn, isolation/env scrub, timeout, concurrency, cancellation).
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
-5. SSE streaming + event→chunk mapping (final → `content`, progress → `reasoning_content`).
-6. Session Store + content-hash resume: tool-aware projection + ModelEntry fingerprint;
-   **hit = resume + last turn, miss = fresh + full projected conversation**.
+5. SSE streaming + event→chunk mapping (final → `content`; progress **per configured client
+   profile** — `reasoning_content` or omitted).
+6. Session Store + content-hash resume: tool-aware projection + ModelEntry fingerprint +
+   **tool-config fingerprint**; **hit = resume + last turn, miss = fresh + read-only transcript
+   replay** (defined renderer, tested over tool-role histories).
 7. `CodexAdapter` (JSONL + `--output-last-message`, sandbox levels, persistent `CODEX_HOME`;
-   `--ephemeral` only on `text`). `AgyAdapter` ships **stateless-replay first**; a
-   **session-id capture spike** gates wiring `--conversation` resume — if capture can't be
-   proven, agy stays replay-only in v1 (logged as a known limitation).
-8. MCP Tool Bridge + suspended sessions keyed by `tool_call_id` (OpenAI `tools` round trip).
-9. Credential-provisioning + security/sandbox hardening pass, per-engine sandbox docs,
-   client-profile (`progress_channel`) wiring, observability polish, e2e smoke.
+   `--ephemeral` only on `text`). `AgyAdapter` ships **stateless-replay first**; an **agy spike**
+   gates `--conversation` resume **and** credential/config isolation — if either can't be
+   proven, agy stays replay-only + single-tenant in v1 (logged as a known limitation).
+8. MCP Tool Bridge: per-process injection (claude `--mcp-config --strict-mcp-config`; codex
+   `-c mcp_servers.*` — validate in spike, gate if it fails; agy off) + suspended sessions
+   keyed by `tool_call_id`.
+9. Credential-provisioning + security/sandbox hardening (cred dirs outside workspace, FS-denied
+   to tools, scrubbed from tool-subprocess env; external OS sandbox for claude/agy full-auto),
+   per-engine sandbox docs, client-profile wiring, observability polish, e2e smoke.
 
 ## 10. Open questions / risks
-- **MCP wiring per engine** differs (config file vs flag); each adapter owns its setup/teardown.
-  Verify each CLI can point at an ad-hoc local MCP server per invocation, especially agy's
-  `mcp_config.json` path and whether it honors per-invocation MCP servers in `--print` mode.
+- **Per-process MCP injection must be race-free:** claude is confirmed (`--mcp-config
+  --strict-mcp-config`); **codex `-c mcp_servers.*` per-invocation injection is unvalidated** and
+  the §9 spike must confirm it before codex `tools` ships (else gate codex MCP); agy has no safe
+  per-invocation MCP config and is gated off.
 - **Suspended-session vs client retry:** if OpenWebUI retries instead of returning the tool
   result, the suspension times out and the next turn starts fresh (acceptable degradation).
-- **agy resume is gated, not assumed:** agy ships stateless-replay-first; the §9 spike must
-  prove a session-id capture mechanism (agy doesn't print it on stdout — likely requires reading
-  agy's session dir under its config dir) before `--conversation <id>` resume is wired. If
-  unprovable, agy stays replay-only in v1.
+- **agy spike covers three things:** session-id capture, credential/config isolation (keyring +
+  `~/.gemini` may not redirect to a service dir), and confirms MCP-off. If isolation can't be
+  proven, agy is operator-login-only / single-tenant in v1.
+- **Credential exfiltration is the top security risk:** cred dirs must be outside the workspace,
+  FS-denied to model-executed tools, and scrubbed from tool-subprocess env. codex
+  `workspace-write` enforces this natively; claude/agy full-auto need an **external OS sandbox**
+  — without one they're trusted-caller-only.
+- **Replay-prompt safety:** the read-only transcript renderer must reliably stop old
+  instructions from being re-executed; covered by tests over tool-role histories (§8).
 - **Credential provisioning is an operator step:** the dedicated per-engine config dirs must be
   logged into / populated once before agentic models work; document per engine.
-- **Sandbox strength is the engine's, not ours:** "full-auto" trusts each CLI's sandbox; agy's
-  coarse boolean sandbox is the weakest and should be documented as such.
