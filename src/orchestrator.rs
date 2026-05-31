@@ -1,9 +1,11 @@
-//! Turn orchestration: the streaming `TurnRunner`, the production `ClaudeProcessRunner`, the
+//! Turn orchestration: the streaming `TurnRunner`, the production `EngineProcessRunner`, the
 //! session-aware `run_request` (key resolution, resume vs fresh, capture + index advancement),
 //! and the events->response aggregation used by the non-streaming path.
-use crate::config::ModelEntry;
+use crate::config::{Credentials, EngineKind, ModelEntry};
+use crate::engine::agy::AgyAdapter;
 use crate::engine::claude::ClaudeAdapter;
-use crate::engine::{AgentEvent, Engine, EngineError, EventStream, Turn};
+use crate::engine::codex::CodexAdapter;
+use crate::engine::{caps_for, AgentEvent, Engine, EngineError, EventStream, Turn};
 use crate::openai::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, ResponseMessage, Role, Usage,
 };
@@ -20,31 +22,56 @@ pub trait TurnRunner: Send + Sync {
     fn run_stream(&self, turn: Turn) -> EventStream;
 }
 
-/// Production runner: builds the claude command and streams its parsed events through the shared
-/// supervisor. Spawn/timeout failures surface as an `AgentEvent::Error` in the stream.
-pub struct ClaudeProcessRunner {
+/// Production runner: dispatches per `turn.engine`, builds that engine's command, and streams its
+/// parsed events through the shared supervisor. Spawn/timeout failures surface as `AgentEvent::Error`.
+/// At clean EOF, if the engine emitted no terminal event (agy's plain-text path), a synthetic
+/// `Done { "stop" }` is appended so the aggregator/SSE layer always sees a finish.
+pub struct EngineProcessRunner {
     pub supervisor: ProcessSupervisor,
-    pub claude_config_dir: Option<PathBuf>,
+    pub credentials: Credentials,
     pub env_passthrough: Vec<String>,
     pub timeout: Duration,
 }
 
-impl TurnRunner for ClaudeProcessRunner {
+fn engine_label(k: EngineKind) -> &'static str {
+    match k {
+        EngineKind::Claude => "claude",
+        EngineKind::Codex => "codex",
+        EngineKind::Agy => "agy",
+    }
+}
+
+impl EngineProcessRunner {
+    fn build_engine(&self, kind: EngineKind) -> Engine {
+        match kind {
+            EngineKind::Claude => Engine::Claude(ClaudeAdapter::new("claude", self.credentials.claude_config_dir.clone())),
+            EngineKind::Codex => Engine::Codex(CodexAdapter::new("codex", self.credentials.codex_home.clone())),
+            EngineKind::Agy => Engine::Agy(AgyAdapter::new("agy", self.credentials.agy_config_dir.clone())),
+        }
+    }
+}
+
+impl TurnRunner for EngineProcessRunner {
     fn run_stream(&self, turn: Turn) -> EventStream {
-        let engine = Engine::Claude(ClaudeAdapter::new("claude", self.claude_config_dir.clone()));
+        let engine = self.build_engine(turn.engine);
         let (cmd, stdin) = engine.build_stream_command(&turn, &self.env_passthrough);
         let lines = self.supervisor.spawn_streaming(cmd, stdin, self.timeout);
+        let kind = turn.engine;
         Box::pin(async_stream::stream! {
             futures::pin_mut!(lines);
+            let mut saw_terminal = false;
             while let Some(item) = lines.next().await {
                 match item {
                     Ok(line) => {
                         for ev in engine.parse_stream_line(&line) {
+                            if matches!(ev, AgentEvent::Done { .. } | AgentEvent::Error(_)) {
+                                saw_terminal = true;
+                            }
                             yield ev;
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        yield AgentEvent::Error("claude timed out".to_string());
+                        yield AgentEvent::Error(format!("{} timed out", engine_label(kind)));
                         return;
                     }
                     Err(e) => {
@@ -53,14 +80,17 @@ impl TurnRunner for ClaudeProcessRunner {
                     }
                 }
             }
+            if !saw_terminal {
+                yield AgentEvent::Done { finish_reason: "stop".to_string() };
+            }
         })
     }
 }
 
-/// Runtime fingerprint for the current process config (feeds the session key).
-pub fn runtime_fingerprint(claude_config_dir: &Option<PathBuf>, sandbox_backend: &str) -> RuntimeFingerprint {
+/// Runtime fingerprint for the resolved engine's home dir + the active sandbox backend.
+pub fn runtime_fingerprint(engine_home: &Option<PathBuf>, sandbox_backend: &str) -> RuntimeFingerprint {
     RuntimeFingerprint {
-        claude_config_dir: claude_config_dir.as_ref().map(|p| p.display().to_string()),
+        engine_home: engine_home.as_ref().map(|p| p.display().to_string()),
         sandbox_backend: sandbox_backend.to_string(),
     }
 }
@@ -93,7 +123,8 @@ pub fn run_request(
 ) -> EventStream {
     let sys = system_prompt_of(req);
     let key = lookup_key(&req.messages, entry, sys.as_deref(), rt);
-    let hit = sessions.get(&key);
+    let can_resume = caps_for(entry.engine).resume_by_id;
+    let hit = if can_resume { sessions.get(&key) } else { None };
 
     let rendered = render_turn(&req.messages);
     let turn = match &hit {
@@ -126,6 +157,7 @@ pub fn run_request(
     let sys_owned = sys.clone();
     let rt_owned = rt.clone();
     let resumed_sid = hit.clone();
+    // `can_resume` is `Copy`, so the stream closure captures it by value directly.
 
     Box::pin(async_stream::stream! {
         futures::pin_mut!(inner);
@@ -140,9 +172,11 @@ pub fn run_request(
             }
             yield ev;
         }
-        if let Some(sid) = session_id {
-            let advanced = stored_key_after(&messages, &assistant_text, &entry, sys_owned.as_deref(), &rt_owned);
-            sessions.insert(advanced, sid);
+        if can_resume {
+            if let Some(sid) = session_id {
+                let advanced = stored_key_after(&messages, &assistant_text, &entry, sys_owned.as_deref(), &rt_owned);
+                sessions.insert(advanced, sid);
+            }
         }
     })
 }
@@ -202,7 +236,7 @@ mod tests {
             workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false }
     }
     fn rt() -> RuntimeFingerprint {
-        RuntimeFingerprint { claude_config_dir: None, sandbox_backend: "none".into() }
+        RuntimeFingerprint { engine_home: None, sandbox_backend: "none".into() }
     }
     fn umsg(t: &str) -> ChatMessage {
         ChatMessage { role: Role::User, content: Some(MessageContent::Text(t.into())), tool_call_id: None }
@@ -277,5 +311,23 @@ mod tests {
         assert_eq!(turn.resume.as_deref(), Some("sess-prev"));
         assert_eq!(turn.user_prompt, "second");          // only the new user turn
         assert!(turn.system_prompt.is_none());            // session already holds it
+    }
+
+    #[tokio::test]
+    async fn agy_never_resumes_or_stores() {
+        let store = Arc::new(SessionStore::new());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let agy = ModelEntry { id: "m".into(), engine: EngineKind::Agy, model: None,
+            workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false };
+        let runner: Arc<dyn TurnRunner> = Arc::new(FakeRunner {
+            events: vec![AgentEvent::SessionId("ignored".into()), AgentEvent::AssistantText("a".into()), AgentEvent::Done { finish_reason: "stop".into() }],
+            seen: seen.clone(),
+        });
+        let messages = vec![umsg("first")];
+        let _ = run_request(runner, store.clone(), &agy, &req(messages), &rt()).collect::<Vec<_>>().await;
+        assert!(seen.lock().unwrap().clone().unwrap().resume.is_none());
+        // Even after a SessionId event, a non-resume engine stores nothing.
+        let m2 = vec![umsg("first"), ChatMessage { role: Role::Assistant, content: Some(MessageContent::Text("a".into())), tool_call_id: None }, umsg("second")];
+        assert_eq!(store.get(&crate::session::lookup_key(&m2, &agy, None, &rt())), None);
     }
 }

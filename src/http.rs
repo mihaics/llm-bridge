@@ -1,6 +1,6 @@
 //! HTTP layer: shared state, router, health/models, bearer auth, and the chat-completions handler
 //! (SSE when `stream:true`, aggregated otherwise). Both paths consume the same event stream.
-use crate::config::{Defaults, ProgressChannel};
+use crate::config::{Credentials, Defaults, EngineKind, ProgressChannel};
 use crate::engine::AgentEvent;
 use crate::openai::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta,
@@ -18,7 +18,6 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +29,7 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub defaults: Defaults,                // used for sandbox_backend in the runtime fingerprint
     pub progress_channel: ProgressChannel, // from cfg.server.progress_channel (NOT on Defaults)
-    pub claude_config_dir: Option<PathBuf>,
+    pub credentials: Credentials, // per-engine home dirs feed the runtime fingerprint
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -74,7 +73,12 @@ async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCom
     let streaming = req.is_streaming();
     let progress = state.progress_channel;
 
-    let rt = runtime_fingerprint(&state.claude_config_dir, &format!("{:?}", state.defaults.sandbox_backend).to_lowercase());
+    let engine_home = match entry.engine {
+        EngineKind::Claude => state.credentials.claude_config_dir.clone(),
+        EngineKind::Codex => state.credentials.codex_home.clone(),
+        EngineKind::Agy => state.credentials.agy_config_dir.clone(),
+    };
+    let rt = runtime_fingerprint(&engine_home, &format!("{:?}", state.defaults.sandbox_backend).to_lowercase());
     let events = run_request(state.runner.clone(), state.sessions.clone(), &entry, &req, &rt);
 
     if streaming {

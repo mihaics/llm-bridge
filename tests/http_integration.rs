@@ -1,5 +1,5 @@
 use http_body_util::BodyExt;
-use llm_bridge::config::{Defaults, EngineKind, Mode, ModelEntry, ProgressChannel};
+use llm_bridge::config::{Credentials, Defaults, EngineKind, Mode, ModelEntry, ProgressChannel};
 use llm_bridge::engine::{AgentEvent, EventStream, Turn};
 use llm_bridge::http::{build_router, AppState};
 use llm_bridge::orchestrator::TurnRunner;
@@ -27,7 +27,7 @@ fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
         sessions: Arc::new(SessionStore::new()),
         defaults: Defaults::default(),
         progress_channel: ProgressChannel::ReasoningContent,
-        claude_config_dir: None,
+        credentials: Credentials::default(),
     }
 }
 fn fake(events: Vec<AgentEvent>) -> Arc<dyn TurnRunner> { Arc::new(FakeRunner { events }) }

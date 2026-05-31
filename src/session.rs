@@ -8,16 +8,17 @@ use crate::registry::model_entry_fingerprint;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Runtime context a native session id only makes sense within (cred dir + sandbox backend).
+/// Runtime context a native session id only makes sense within (the engine's cred/home dir +
+/// sandbox backend). `engine_home` is `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / agy's config context.
 #[derive(Debug, Clone)]
 pub struct RuntimeFingerprint {
-    pub claude_config_dir: Option<String>,
+    pub engine_home: Option<String>,
     pub sandbox_backend: String,
 }
 
 impl RuntimeFingerprint {
     fn canon(&self) -> String {
-        format!("cfg={:?};sandbox={}", self.claude_config_dir, self.sandbox_backend)
+        format!("home={:?};sandbox={}", self.engine_home, self.sandbox_backend)
     }
 }
 
@@ -106,7 +107,7 @@ mod tests {
             workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false }
     }
     fn rt() -> RuntimeFingerprint {
-        RuntimeFingerprint { claude_config_dir: Some("/cred".into()), sandbox_backend: "none".into() }
+        RuntimeFingerprint { engine_home: Some("/cred".into()), sandbox_backend: "none".into() }
     }
     fn msg(role: Role, t: &str) -> ChatMessage {
         ChatMessage { role, content: Some(MessageContent::Text(t.into())), tool_call_id: None }
