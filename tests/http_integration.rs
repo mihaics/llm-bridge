@@ -112,6 +112,22 @@ async fn streaming_omit_profile_drops_reasoning() {
 }
 
 #[tokio::test]
+async fn streaming_emits_tool_calls_chunk() {
+    let runner = fake(vec![
+        AgentEvent::ToolCall { id: "call_1".into(), name: "search".into(), args: "{}".into() },
+        AgentEvent::Done { finish_reason: "tool_calls".into() },
+    ]);
+    let app = build_router(state_with(None, runner));
+    let body = r#"{"model":"claude-text","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+    let b = body_string(r).await;
+    assert!(b.contains(r#""tool_calls":[{"index":0,"id":"call_1","type":"function""#), "{b}");
+    assert!(b.contains(r#""name":"search""#), "{b}");
+    assert!(b.contains(r#""finish_reason":"tool_calls""#), "{b}");
+    assert!(b.trim_end().ends_with("data: [DONE]"), "{b}");
+}
+
+#[tokio::test]
 async fn unknown_model_404_and_tools_400() {
     let app = build_router(state(None));
     let r1 = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(r#"{"model":"nope","messages":[]}"#)).unwrap()).await.unwrap();

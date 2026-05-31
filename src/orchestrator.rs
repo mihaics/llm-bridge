@@ -205,19 +205,30 @@ pub fn response_from_events(
     model_id: &str,
 ) -> Result<ChatCompletionResponse, EngineError> {
     let mut content = String::new();
+    let mut tool_calls: Vec<crate::openai::ToolCall> = Vec::new();
     let mut finish_reason = "stop".to_string();
     for ev in events {
         match ev {
             AgentEvent::AssistantText(t) => content.push_str(&t),
+            AgentEvent::ToolCall { id, name, args } => tool_calls.push(crate::openai::ToolCall {
+                id,
+                kind: "function".into(),
+                function: crate::openai::FunctionCall { name, arguments: args },
+            }),
             AgentEvent::Done { finish_reason: fr } => finish_reason = fr,
             AgentEvent::Error(m) => return Err(EngineError::Reported(m)),
             AgentEvent::Reasoning(_)
             | AgentEvent::ToolStart { .. }
             | AgentEvent::ToolResult { .. }
-            | AgentEvent::ToolCall { .. }
             | AgentEvent::SessionId(_) => {}
         }
     }
+    // OpenAI: when the turn made tool calls, the message carries `tool_calls` and finishes "tool_calls".
+    let (tool_calls, finish_reason) = if tool_calls.is_empty() {
+        (None, finish_reason)
+    } else {
+        (Some(tool_calls), "tool_calls".to_string())
+    };
     Ok(ChatCompletionResponse {
         id: format!("chatcmpl-{}", unix_now()),
         object: "chat.completion",
@@ -225,7 +236,7 @@ pub fn response_from_events(
         model: model_id.to_string(),
         choices: vec![Choice {
             index: 0,
-            message: ResponseMessage { role: "assistant", content, tool_calls: None },
+            message: ResponseMessage { role: "assistant", content, tool_calls },
             finish_reason,
         }],
         usage: Usage::default(),
@@ -274,6 +285,20 @@ mod tests {
 
     fn aggregate(events: Vec<AgentEvent>) -> crate::openai::ChatCompletionResponse {
         response_from_events(events, "m").unwrap()
+    }
+
+    #[test]
+    fn response_from_events_collects_tool_calls_and_forces_finish_reason() {
+        let resp = aggregate(vec![
+            AgentEvent::ToolCall { id: "call_1".into(), name: "search".into(), args: r#"{"q":"x"}"#.into() },
+            AgentEvent::Done { finish_reason: "tool_calls".into() },
+        ]);
+        assert_eq!(resp.choices[0].finish_reason, "tool_calls");
+        let calls = resp.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "search");
+        assert_eq!(calls[0].function.arguments, r#"{"q":"x"}"#);
+        assert_eq!(resp.choices[0].message.content, "");
     }
 
     #[test]

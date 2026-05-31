@@ -3,7 +3,8 @@
 use crate::config::{Credentials, Defaults, EngineKind, ProgressChannel};
 use crate::engine::AgentEvent;
 use crate::openai::{
-    ApiError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta,
+    ApiError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, DeltaFunctionCall,
+    DeltaToolCall,
 };
 use crate::orchestrator::{response_from_events, run_request, runtime_fingerprint, TurnRunner};
 use crate::registry::Registry;
@@ -101,6 +102,7 @@ fn sse_response(
     let id = format!("chatcmpl-{}", unix_now());
     let created = unix_now();
     let mut role_sent = false;
+    let mut tool_idx: u32 = 0;
 
     let stream = async_stream::stream! {
         futures::pin_mut!(events);
@@ -122,7 +124,23 @@ fn sse_response(
                     (Some(Delta { role: None, content: Some(format!("[error: {m}]")), reasoning_content: None, tool_calls: None }), Some("stop".to_string()))
                 }
                 AgentEvent::SessionId(_) => (None, None),
-                AgentEvent::ToolCall { .. } => (None, None), // mapped to tool_calls in a later task
+                AgentEvent::ToolCall { id, name, args } => {
+                    let role = (!role_sent).then(|| { role_sent = true; "assistant" });
+                    let index = tool_idx;
+                    tool_idx += 1;
+                    let delta = Delta {
+                        role,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(vec![DeltaToolCall {
+                            index,
+                            id: Some(id),
+                            kind: Some("function"),
+                            function: DeltaFunctionCall { name: Some(name), arguments: Some(args) },
+                        }]),
+                    };
+                    (Some(delta), None)
+                }
             };
             if let Some(delta) = delta {
                 let chunk = ChatCompletionChunk {
