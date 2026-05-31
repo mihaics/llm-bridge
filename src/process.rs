@@ -85,6 +85,57 @@ impl ProcessSupervisor {
             drop(child);
         }
     }
+
+    /// Like `spawn_streaming` but WITHOUT acquiring a concurrency permit — the caller manages the
+    /// active slot (via `acquire`/drop) so a parked tool-call suspension can release it while idle.
+    pub fn spawn_streaming_unmetered(
+        &self,
+        mut cmd: Command,
+        stdin: Option<String>,
+        timeout: Duration,
+    ) -> impl Stream<Item = std::io::Result<String>> + Send {
+        async_stream::stream! {
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd.kill_on_drop(true);
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => { yield Err(e); return; }
+            };
+
+            if let Some(payload) = stdin {
+                if let Some(mut sink) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sink.write_all(payload.as_bytes()).await;
+                    let _ = sink.shutdown().await;
+                }
+            }
+
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => { yield Err(std::io::Error::other("no stdout")); return; }
+            };
+            let mut reader = BufReader::new(stdout).lines();
+            let deadline = tokio::time::Instant::now() + timeout;
+
+            loop {
+                match tokio::time::timeout_at(deadline, reader.next_line()).await {
+                    Ok(Ok(Some(line))) => yield Ok(line),
+                    Ok(Ok(None)) => break,                       // clean EOF
+                    Ok(Err(e)) => { yield Err(e); break; }
+                    Err(_elapsed) => {
+                        yield Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "child timed out"));
+                        break;
+                    }
+                }
+            }
+            // `child` (kill_on_drop) drops here when the stream is dropped/exhausted. No permit is
+            // held: the caller owns the active slot.
+            drop(child);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +161,21 @@ mod tests {
         let stream = sup.spawn_streaming(cmd, None, Duration::from_secs(5));
         let lines: Vec<String> = stream.filter_map(|r| async move { r.ok() }).collect().await;
         assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn spawn_streaming_unmetered_yields_lines_without_consuming_a_permit() {
+        use futures::StreamExt;
+        let sup = ProcessSupervisor::new(2);
+        assert_eq!(sup.available(), 2);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("printf 'a\\nb\\nc\\n'");
+        let stream = sup.spawn_streaming_unmetered(cmd, None, Duration::from_secs(5));
+        // available() stays unchanged while the stream is live (no permit acquired by the variant).
+        assert_eq!(sup.available(), 2);
+        let lines: Vec<String> = stream.filter_map(|r| async move { r.ok() }).collect().await;
+        assert_eq!(lines, vec!["a", "b", "c"]);
+        assert_eq!(sup.available(), 2);
     }
 
     #[tokio::test]
