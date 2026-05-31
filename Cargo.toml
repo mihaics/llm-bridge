@@ -16,6 +16,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 async-stream = "0.3"
+rmcp = { version = "1.7", features = ["client", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot for router tests

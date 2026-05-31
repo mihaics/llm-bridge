@@ -75,6 +75,24 @@ pub struct FunctionCall {
 
 fn function_kind() -> String { "function".to_string() }
 
+/// An incoming OpenAI tool definition (`{"type":"function","function":{...}}`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolDef {
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema for the arguments; `Value::Null` if omitted.
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -94,6 +112,14 @@ impl ChatCompletionRequest {
     }
     pub fn has_tools(&self) -> bool {
         matches!(&self.tools, Some(serde_json::Value::Array(a)) if !a.is_empty())
+    }
+    /// The request's tool definitions, parsed from the opaque `tools` array. Entries not matching
+    /// `{type:"function", function:{name,...}}` are skipped (never an error).
+    pub fn tool_defs(&self) -> Vec<ToolDef> {
+        let Some(serde_json::Value::Array(items)) = &self.tools else { return Vec::new(); };
+        items.iter().filter_map(|v| serde_json::from_value::<ToolDef>(v.clone()).ok())
+            .filter(|d| !d.function.name.is_empty())
+            .collect()
     }
 }
 
@@ -284,5 +310,29 @@ mod tests {
         }])};
         let s = serde_json::to_string(&d).unwrap();
         assert!(s.contains(r#""tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"{}"}}]"#), "{s}");
+    }
+
+    #[test]
+    fn tool_defs_parses_function_definitions() {
+        let json = r#"{"model":"m","tools":[
+            {"type":"function","function":{"name":"search","description":"find","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}},
+            {"type":"function","function":{"name":"noparams"}}
+        ],"messages":[]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let defs = req.tool_defs();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].function.name, "search");
+        assert_eq!(defs[0].function.description.as_deref(), Some("find"));
+        assert_eq!(defs[0].function.parameters["type"], "object");
+        assert_eq!(defs[1].function.name, "noparams");
+        assert!(defs[1].function.parameters.is_null() || defs[1].function.parameters.is_object());
+    }
+
+    #[test]
+    fn tool_defs_empty_when_no_tools_or_malformed() {
+        let none: ChatCompletionRequest = serde_json::from_str(r#"{"model":"m","messages":[]}"#).unwrap();
+        assert!(none.tool_defs().is_empty());
+        let bad: ChatCompletionRequest = serde_json::from_str(r#"{"model":"m","tools":[{"x":1}],"messages":[]}"#).unwrap();
+        assert!(bad.tool_defs().is_empty());
     }
 }

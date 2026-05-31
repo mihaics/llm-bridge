@@ -40,12 +40,25 @@ impl SessionStore {
 }
 
 /// Canonical projection of a message list: role + flattened content per message, newline-joined.
-/// (`tool_calls` are intentionally NOT folded into the key yet; Phase 4b extends this with the
-/// normalized tool_call ids/args once the bridge produces them.)
+/// Tool calls (name + canonicalized args) and tool_call_id are folded in so two threads that differ
+/// only in tool activity hash differently (spec §4.5).
 fn project(messages: &[ChatMessage]) -> String {
     messages
         .iter()
-        .map(|m| format!("{:?}:{}", m.role, m.text()))
+        .map(|m| {
+            let mut s = format!("{:?}:{}", m.role, m.text());
+            // Fold the assistant's tool_calls (name + canonicalized args) so two threads that differ
+            // only in tool activity don't hash identically (spec §4.5).
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    s.push_str(&format!("|tc:{}:{}:{}", c.id, c.function.name, c.function.arguments));
+                }
+            }
+            if let Some(id) = &m.tool_call_id {
+                s.push_str(&format!("|tcid:{id}"));
+            }
+            s
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -79,7 +92,9 @@ fn final_user_idx(messages: &[ChatMessage]) -> Option<usize> {
     messages.iter().rposition(|m| m.role == Role::User)
 }
 
-/// Key to LOOK UP on an incoming request: hash of the prefix BEFORE the final user turn.
+/// Key to LOOK UP on an incoming request: hash of the prefix BEFORE the final user turn. (Tool-result
+/// follow-ups — threads ending in a `role:"tool"` suffix — are routed to the suspended-session
+/// registry in the HTTP layer and never reach this function.)
 pub fn lookup_key(messages: &[ChatMessage], entry: &ModelEntry, system_prompt: Option<&str>, rt: &RuntimeFingerprint) -> String {
     let cut = final_user_idx(messages).unwrap_or(messages.len());
     key_for(&messages[..cut], entry, system_prompt, rt)
@@ -146,5 +161,28 @@ mod tests {
         let with_rt = lookup_key(&m, &entry(), None, &rt2);
         assert_ne!(base, with_sys);
         assert_ne!(base, with_rt);
+    }
+
+    #[test]
+    fn key_folds_tool_calls_so_post_tool_threads_differ() {
+        // A follow-up USER turn after past tool use: the two threads' PREFIXES (the history the
+        // lookup key hashes) differ only in the historical assistant tool_calls / tool result, so
+        // `project()` folding those must make the keys differ (else two distinct post-tool threads
+        // would resume the same native session — spec §4.5).
+        let mut a = vec![msg(Role::User, "do it")];
+        a.push(ChatMessage { role: Role::Assistant, content: None, tool_call_id: None,
+            tool_calls: Some(vec![crate::openai::ToolCall { id: "c1".into(), kind: "function".into(),
+                function: crate::openai::FunctionCall { name: "f".into(), arguments: "{\"x\":1}".into() } }]) });
+        a.push(ChatMessage { role: Role::Tool, content: Some(MessageContent::Text("R1".into())),
+            tool_call_id: Some("c1".into()), tool_calls: None });
+        a.push(msg(Role::User, "and now?")); // ends with a user turn -> lookup_key keys the prefix above
+        let mut b = vec![msg(Role::User, "do it")];
+        b.push(ChatMessage { role: Role::Assistant, content: None, tool_call_id: None,
+            tool_calls: Some(vec![crate::openai::ToolCall { id: "c1".into(), kind: "function".into(),
+                function: crate::openai::FunctionCall { name: "f".into(), arguments: "{\"x\":2}".into() } }]) });
+        b.push(ChatMessage { role: Role::Tool, content: Some(MessageContent::Text("R2".into())),
+            tool_call_id: Some("c1".into()), tool_calls: None });
+        b.push(msg(Role::User, "and now?"));
+        assert_ne!(lookup_key(&a, &entry(), None, &rt()), lookup_key(&b, &entry(), None, &rt()));
     }
 }
