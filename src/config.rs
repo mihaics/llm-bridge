@@ -32,6 +32,10 @@ pub struct Defaults {
     pub sandbox_backend: SandboxBackend,
     #[serde(default = "default_env_passthrough")]
     pub env_passthrough: Vec<String>,
+    #[serde(default = "default_tool_result_timeout_s")]
+    pub tool_result_timeout_s: u64,
+    #[serde(default = "default_max_suspended_sessions")]
+    pub max_suspended_sessions: usize,
 }
 
 impl Default for Defaults {
@@ -41,12 +45,16 @@ impl Default for Defaults {
             max_concurrency: default_max_concurrency(),
             sandbox_backend: SandboxBackend::default(),
             env_passthrough: default_env_passthrough(),
+            tool_result_timeout_s: default_tool_result_timeout_s(),
+            max_suspended_sessions: default_max_suspended_sessions(),
         }
     }
 }
 
 fn default_timeout_s() -> u64 { 600 }
 fn default_max_concurrency() -> usize { 4 }
+fn default_tool_result_timeout_s() -> u64 { 120 }
+fn default_max_suspended_sessions() -> usize { 16 }
 /// Non-secret vars the spawned CLI needs to run. Everything else is scrubbed (env_clear).
 pub fn default_env_passthrough() -> Vec<String> {
     ["PATH", "HOME", "LANG", "LC_ALL", "TERM"].iter().map(|s| s.to_string()).collect()
@@ -216,6 +224,20 @@ models:
         assert_eq!(cfg.defaults.env_passthrough, default_env_passthrough());
         assert!(!cfg.models[0].trusted_caller_only);
         assert_eq!(cfg.server.progress_channel, ProgressChannel::ReasoningContent);
+        assert_eq!(cfg.defaults.tool_result_timeout_s, 120);
+        assert_eq!(cfg.defaults.max_suspended_sessions, 16);
+    }
+
+    #[test]
+    fn parses_suspension_knobs() {
+        let yaml = r#"
+server: { bind: "127.0.0.1:9000" }
+defaults: { tool_result_timeout_s: 45, max_suspended_sessions: 4 }
+models: []
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        assert_eq!(cfg.defaults.tool_result_timeout_s, 45);
+        assert_eq!(cfg.defaults.max_suspended_sessions, 4);
     }
 
     #[test]
