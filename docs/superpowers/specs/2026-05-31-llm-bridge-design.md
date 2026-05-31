@@ -162,9 +162,13 @@ workspace, mode, permissions) feeds the session key (§4.5).
 ### 4.3 Turn Orchestrator
 For each request:
 1. Resolve `model` → `ModelEntry`. Unknown model → OpenAI error.
-2. **If the request's messages reference `tool_call_id`s of a live suspended session
-   (§4.6), route there** (tool-result follow-up). Otherwise continue.
-3. Split `messages` into system prompt + conversation; compute the **session key** (§4.5).
+2. **Tool-result routing.** If the request's `role:"tool"` messages match a live suspended
+   session, route there (§4.6). If the request **contains** `role:"tool"` messages but matches
+   **no** live suspension (e.g. a retry after the group timed out), it is **not** a normal turn —
+   return **`400`** (unknown/expired `tool_call_id`s) rather than falling through to session-key
+   computation, since a `tool`-terminated request has no final user turn to act on.
+3. Otherwise (a normal user turn): split `messages` into system prompt + conversation; compute
+   the **session key** (§4.5).
 4. Resolve session, select the engine, build the spawn command.
 5. If the request carries `tools`, stand up the MCP bridge (§4.6) and wire the CLI to it.
 6. Spawn via the Process Supervisor, consume normalized `AgentEvent`s, map events → OpenAI
@@ -294,29 +298,40 @@ When a request carries `tools`:
 3. OpenAI's protocol means the client executes the tools and returns results in a **follow-up
    request** containing the assistant message with those `tool_calls` **and** one
    `role:"tool"` message per call carrying the matching **`tool_call_id`** — *not* a new user
-   turn. Results for multiple calls may arrive together or be split across requests.
+   turn. Per OpenAI semantics the client returns **all** tool outputs for the turn in **one**
+   follow-up request (it is not a clean Chat Completions flow to hold one HTTP request open
+   waiting for a *later* request to bring the rest).
 
 **Suspended-session mechanism — turn-level group keyed by `tool_call_id`s:** the process that
 hit client tool calls is **held open** in a `SuspendedSessions` registry as a **group**
 recording *all* outstanding `tool_call_id`s for that turn, each with its own **parked MCP call**.
 The orchestrator (§4.3 step 2) routes a follow-up by matching the request's `role:"tool"`
 `tool_call_id`s against the group. Handling rules:
-- **Per-result delivery:** each arriving `tool` result is delivered into the MCP call parked on
-  its `tool_call_id`; the agent process unblocks each call independently.
-- **Resume-when-complete:** the process resumes/streams forward only once **all** outstanding
-  ids in the group have results — partial follow-ups are accepted and the group waits for the
-  rest.
-- **Duplicate result** for an already-satisfied id → ignored (idempotent) with a warning log.
-- **Unknown id** (no matching parked call) → OpenAI `400` error.
-- **Orphan timeout:** if the full set never arrives (client abandons or retries), the suspension
-  is reaped and the child killed; the next turn starts fresh.
+- **All-or-error (one follow-up carries the whole set):** a follow-up must supply a `tool`
+  result for **every** outstanding id in the group. On a complete set, each result is delivered
+  into its parked MCP call, every call unblocks, and the process resumes — its continuation is
+  streamed as the response to *this* follow-up request.
+- **Partial set** (some outstanding ids missing) → **`409`** with the list of missing ids; the
+  suspension stays open until its timeout so a corrected follow-up can succeed. We do **not**
+  hold the partial request open waiting for a separate future request.
+- **Duplicate result** for an id already supplied in the same request → `400`.
+- **Unknown id** (no matching parked call in any live suspension) → **`400`** (see §4.3 step 2;
+  this also covers a retry after the group already timed out).
+- **Orphan timeout** (`tool_result_timeout_s`, §6): if no complete follow-up arrives in time,
+  the suspension is reaped and the child killed; a later retry then hits the unknown-id path.
 
 This is the only place a process outlives a single HTTP request: bounded (only with `tools`),
-keyed by the turn's `tool_call_id` group, and time-limited.
+keyed by the turn's `tool_call_id` group, time-limited by `tool_result_timeout_s`, and capped by
+`max_suspended_sessions`. **Accounting:** a parked suspension is idle (awaiting the client), so
+it releases its active `max_concurrency` slot but occupies one of `max_suspended_sessions`; new
+suspensions past that cap are refused (`503`). On resume it must re-acquire an active slot
+(queueing if the pool is full).
 
 ### 4.7 Process Supervisor
-Spawns child CLIs via `tokio::process`; per-turn timeouts (→ `504`); a global concurrency cap
-with a bounded queue; cancellation/kill on client disconnect or shutdown.
+Spawns child CLIs via `tokio::process`; per-turn active timeout (`timeout_s` → `504`); a
+`max_concurrency` cap on **active** turns with a bounded queue; a separate `max_suspended_sessions`
+pool for parked tool-call groups (each reaped at `tool_result_timeout_s`); cancellation/kill on
+client disconnect or shutdown. A resuming suspension re-acquires an active slot (§4.6).
 
 ### 4.8 Safety / permissions (hardened)
 The agent posture is **sandboxed full-auto**, but because this is an HTTP service that triggers
@@ -333,10 +348,18 @@ file edits and command execution, the boundary is hardened on multiple axes:
   1. a one-time interactive login into the service dir (`CLAUDE_CONFIG_DIR=… claude login`,
      `CODEX_HOME=… codex login`, etc.) — the documented default;
   2. copying only the minimal auth/token file into the service dir; or
-  3. an API-key env var for engines that accept one.
+  3. an API-key env var — **codex/text profiles only** (see env-auth restriction below).
   These dirs are **persistent** (not `--ephemeral`): codex resumable runs need a stable
   `CODEX_HOME` to keep session files; `--ephemeral` is reserved for `text` profiles that never
   resume. The provisioning steps are part of the deployment docs.
+- **API-key env auth is restricted for claude/agy agentic.** An API key in the CLI's env is
+  inherited by the shell tools the agent spawns unless the env is scrubbed per-tool. Codex
+  exposes `shell_environment_policy` to strip it; **claude and agy expose no equivalent** in the
+  checked help. So for **claude/agy `mode: agentic`, API-key env auth is disallowed** (use
+  file-based login, options 1–2, which the FS/sandbox rules below can contain) **unless** a
+  configured `sandbox_backend` proves the tool subprocess env is scrubbed. Startup validation
+  (§4.8 below, §9) rejects the unsafe combination. Codex agentic and all `text` profiles may use
+  env keys (codex scrubs; text profiles run no tools).
 - **Credential dirs must be unreadable by model-executed tools.** The service credential dirs
   hold real secrets (Claude's `CLAUDE_CONFIG_DIR` stores credentials, session history, settings,
   plugins; `CODEX_HOME` likewise). Since the agent runs shell/file tools, a request could
@@ -344,8 +367,11 @@ file edits and command execution, the boundary is hardened on multiple axes:
   **outside any workspace** and the **sandbox filesystem policy denies read** of them — so
   agentic models run at `read-only`/`workspace-write`, **never** `danger-full-access` /
   `--dangerously-skip-permissions` unless an external OS sandbox already isolates the cred dir;
-  and (2) the credential-dir path is set on the **CLI process env only** and scrubbed from the
-  environment of any tool subprocess the agent spawns, so it isn't leaked to model-run shells.
+  and (2) secrets are kept out of the tool subprocess environment where the engine allows it —
+  codex via `shell_environment_policy`, others via the configured `sandbox_backend`. Because
+  **claude/agy expose no per-tool env scrubbing**, claude/agy agentic rely on **file-based auth +
+  FS denial** of the cred dir rather than env (hence the API-key env restriction above); their
+  env cannot be assumed scrubbed without an external sandbox.
 - **Workspace confinement:** canonicalize the configured workspace path, reject symlinks that
   escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
 - **Per-engine sandbox is documented, not assumed uniform — and "full-auto" ≠ "full access":**
@@ -362,12 +388,16 @@ file edits and command execution, the boundary is hardened on multiple axes:
   The config's `permissions` maps to the strongest available control per engine; the docs state
   each engine's actual guarantee (the sandbox strength is the *engine's* — or the host OS's —
   not ours).
-- **Startup validation ties config to posture.** A claude/agy model with `mode: agentic` and no
-  `sandbox_backend` configured (§6) starts **only** if it is explicitly marked
-  `trusted_caller_only: true`; otherwise the server refuses to start with a clear message. This
-  prevents the config from *implying* confinement that isn't there. When a `sandbox_backend`
-  (bubblewrap/namespace/container) is configured, the engine runs inside it and the flag isn't
-  required. Codex `workspace-write` is self-confining and needs neither.
+- **Startup validation ties config to posture.** The server refuses to start (clear message) on
+  unsafe combinations:
+  - a claude/agy `mode: agentic` model with no `sandbox_backend` unless explicitly marked
+    `trusted_caller_only: true` — prevents the config from *implying* confinement that isn't
+    there; and
+  - a claude/agy `mode: agentic` model authed by **API-key env var** with no `sandbox_backend`
+    (the key would leak into spawned shell tools — see env-auth restriction above).
+  When a `sandbox_backend` (bubblewrap/namespace/container) is configured, the engine runs inside
+  it and neither restriction applies. Codex `workspace-write` is self-confining and `text`
+  profiles run no tools, so both are exempt.
 - **`mode: text`** replicates the PoC: empty temp dir, all tools blocked — a safe pure-generator.
 
 ## 5. Data flow
@@ -384,10 +414,12 @@ bridging); `[DONE]` at `Done`; client disconnect cancels the child. (`agy`: a si
 chunk, no progress.)
 
 **Tool-call round trip (MCP bridge)** — request with `tools` → MCP server up, CLI wired in;
-agent calls a tool → emit `tool_calls` (with `tool_call_id`), finish `tool_calls`, **suspend**
-the process keyed by that id; client runs the tool, sends a follow-up with the matching
-`role:"tool"` result; orchestrator matches the `tool_call_id` to the suspension, delivers the
-result into the parked MCP call, the agent continues, the response resumes.
+agent calls one or more tools → emit the turn's `tool_call`s (each with a `tool_call_id`), finish
+`tool_calls`, **suspend** the process as a group keyed by *all* of that turn's ids; client runs
+the tools and sends **one** follow-up carrying every `role:"tool"` result; orchestrator matches
+the full id set to the suspended group, delivers each result into its parked MCP call, the agent
+continues, and the continuation is the response to that follow-up. (Partial set → `409`; unknown/
+expired ids → `400`; see §4.6.)
 
 ## 6. Configuration
 
@@ -397,8 +429,10 @@ server:
   bearer_token: "sk-..."        # required if bind is non-loopback
   progress_channel: reasoning_content  # reasoning_content (OpenWebUI) | omit (strict OpenAI)
 defaults:
-  timeout_s: 600
-  max_concurrency: 4
+  timeout_s: 600                       # per-turn active work timeout (-> 504)
+  max_concurrency: 4                   # active (running) turns; suspended turns don't count here
+  tool_result_timeout_s: 120           # how long a suspended tool-call group waits for results
+  max_suspended_sessions: 16           # cap on parked tool-call processes (excess -> 503)
   session_store: { backend: sled, path: ~/.llm-bridge/sessions, ttl_h: 24 }
   env_passthrough: ["PATH", "LANG"]    # everything else scrubbed from spawned CLIs
   sandbox_backend: none                # none | bubblewrap | container — required for claude/agy
@@ -434,9 +468,12 @@ dropdown. The model id is the entire control surface for OpenWebUI; the registry
 everything else.
 
 ## 7. Error handling, concurrency, observability
-- OpenAI-shaped error bodies; CLI nonzero exit → `500` with stderr; timeout → `504`; unknown
-  model → `404`; bad request → `400`; missing/invalid token → `401`.
-- Concurrency cap with a bounded queue; reject or queue past the limit.
+- OpenAI-shaped error bodies; CLI nonzero exit → `500` with stderr; active timeout → `504`;
+  unknown model → `404`; bad request / unknown-or-expired `tool_call_id` / duplicate result →
+  `400`; partial tool-result set → `409` (with missing ids); suspended-session pool full →
+  `503`; missing/invalid token → `401`.
+- `max_concurrency` cap (active turns) with a bounded queue; separate `max_suspended_sessions`
+  pool for parked tool-call groups; reject or queue past the limits.
 - `tracing` spans per turn with a request id; structured logs of the spawn command (secrets
   redacted), engine, model, session hit/miss, duration, exit status.
 - Graceful shutdown drains/kills children and any suspended sessions.
@@ -448,9 +485,11 @@ everything else.
   streaming channel mapping, `reasoning_content` vs `content` split, tool-call
   suspension/resume by `tool_call_id`, cancellation).
 - **MCP bridge** tested with an in-process `rmcp` client driving a scripted suspension round
-  trip (including the `tool_call_id` routing and the orphan timeout); plus a **concurrency test**
-  asserting two simultaneous tool-bearing requests get isolated per-process MCP wiring (distinct
-  temp configs / sockets, no cross-talk).
+  trip (single- and **multi-`tool_call`** turns), asserting: complete follow-up resumes; partial
+  set → `409` (missing ids) with the suspension still live; duplicate result → `400`; unknown/
+  expired id → `400`; orphan timeout reaps the child; and `max_suspended_sessions` overflow →
+  `503`. Plus a **concurrency test** asserting two simultaneous tool-bearing requests get isolated
+  per-process MCP wiring (distinct temp configs / sockets, no cross-talk).
 - **Session key** tested for fingerprint sensitivity (same id + changed workspace ⇒ different
   key; same conversation + different `tools`/`tool_choice` ⇒ different key) and prefix-rotation
   correctness.
@@ -476,11 +515,13 @@ everything else.
    gates `--conversation` resume **and** credential/config isolation — if either can't be
    proven, agy stays replay-only + single-tenant in v1 (logged as a known limitation).
 8. MCP Tool Bridge: per-process injection (claude `--mcp-config --strict-mcp-config`; codex
-   `-c mcp_servers.*` — validate in spike, gate if it fails; agy off) + suspended sessions
-   keyed by `tool_call_id`.
-9. Credential-provisioning + security/sandbox hardening (cred dirs outside workspace, FS-denied
-   to tools, scrubbed from tool-subprocess env; external OS sandbox for claude/agy full-auto),
-   per-engine sandbox docs, client-profile wiring, observability polish, e2e smoke.
+   `-c mcp_servers.*` — validate in spike, gate if it fails; agy off) + **turn-level suspended
+   groups** (all-or-`409`, unknown/expired→`400`, `tool_result_timeout_s`, `max_suspended_sessions`
+   accounting).
+9. Credential-provisioning + security/sandbox hardening (cred dirs outside workspace, FS-denied to
+   tools; codex env-scrub via `shell_environment_policy`; **API-key env disallowed for claude/agy
+   agentic** without a sandbox; external OS sandbox for claude/agy full-auto), startup-validation
+   rules, per-engine sandbox docs, client-profile wiring, observability polish, e2e smoke.
 
 ## 10. Open questions / risks
 - **Per-process MCP injection must be race-free:** claude is confirmed (`--mcp-config
@@ -491,9 +532,11 @@ everything else.
   multi-tenant deployment could cross-resume users. v1 does not support multi-tenant use; a
   trusted-proxy identity header namespacing the key is the documented future extension point.
 - **Suspended-session vs client retry / multi-call:** suspensions are turn-level groups that
-  resume only when all `tool_call_id`s have results; if the client retries or abandons instead of
-  returning the full set, the group times out and the next turn starts fresh (acceptable
-  degradation).
+  resume only on a single follow-up carrying the **complete** result set (partial → `409`,
+  unknown/expired → `400`). Parked processes don't hold an active concurrency slot but are capped
+  by `max_suspended_sessions` and reaped at `tool_result_timeout_s`; an abandoning client just
+  triggers the reap. This bounds the worst case (a client opening many tool turns and never
+  completing them) to `max_suspended_sessions` idle processes.
 - **agy spike covers three things:** session-id capture, credential/config isolation (keyring +
   `~/.gemini` may not redirect to a service dir), and confirms MCP-off. If isolation can't be
   proven, agy is operator-login-only / single-tenant in v1.
