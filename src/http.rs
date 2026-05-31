@@ -149,6 +149,7 @@ fn sse_response(
     let created = unix_now();
     let mut role_sent = false;
     let mut tool_idx: u32 = 0;
+    let mut saw_tool_call = false;
 
     let stream = async_stream::stream! {
         futures::pin_mut!(events);
@@ -164,7 +165,13 @@ fn sse_response(
                         ProgressChannel::Omit => (None, None),
                     }
                 }
-                AgentEvent::Done { finish_reason } => (Some(Delta::default()), Some(finish_reason)),
+                AgentEvent::Done { finish_reason } => {
+                    // OpenAI: a turn that emitted tool_calls finishes "tool_calls" on BOTH transports.
+                    // Force it here so the SSE path matches the aggregate path regardless of the
+                    // engine's terminal event (the aggregator does the same in response_from_events).
+                    let fr = if saw_tool_call { "tool_calls".to_string() } else { finish_reason };
+                    (Some(Delta::default()), Some(fr))
+                }
                 AgentEvent::Error(m) => {
                     // Surface as a final assistant note + stop; SSE has no error frame.
                     (Some(Delta { role: None, content: Some(format!("[error: {m}]")), reasoning_content: None, tool_calls: None }), Some("stop".to_string()))
@@ -174,6 +181,7 @@ fn sse_response(
                     let role = (!role_sent).then(|| { role_sent = true; "assistant" });
                     let index = tool_idx;
                     tool_idx += 1;
+                    saw_tool_call = true;
                     let delta = Delta {
                         role,
                         content: None,

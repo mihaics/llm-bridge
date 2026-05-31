@@ -216,6 +216,22 @@ async fn tool_result_followup_resumes_suspension() {
 }
 
 #[tokio::test]
+async fn streaming_forces_tool_calls_finish_reason() {
+    // Even if the engine's terminal Done says "stop", a turn that emitted a tool_call must finish
+    // "tool_calls" on the SSE transport (matching the aggregate path).
+    let runner = fake(vec![
+        AgentEvent::ToolCall { id: "call_1".into(), name: "f".into(), args: "{}".into() },
+        AgentEvent::Done { finish_reason: "stop".into() },
+    ]);
+    let app = build_router(state_with(None, runner));
+    let body = r#"{"model":"claude-text","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+    let b = body_string(r).await;
+    assert!(b.contains(r#""finish_reason":"tool_calls""#), "{b}");
+    assert!(!b.contains(r#""finish_reason":"stop""#), "{b}");
+}
+
+#[tokio::test]
 async fn partial_tool_results_409() {
     let (st, _rxs) = state_with_suspension(&["call_a", "call_b"]);
     let app = build_router(st);

@@ -82,7 +82,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: Option<bool>,
-    /// Accepted but unused in Phase 1 (MCP bridge is Phase 4).
+    /// Tool definitions — opaque in Phase 4a (drives the tools gate via `has_tools()`); consumed by
+    /// the live MCP bridge in Phase 4b.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
 }
