@@ -9,8 +9,11 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::ErrorData as McpError;
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -90,6 +93,69 @@ impl ServerHandler for McpBridge {
     }
 }
 
+/// A live per-turn MCP server: the rmcp `StreamableHttpService` on an ephemeral port, the receiver
+/// of the agent's tool calls, and the temp `--mcp-config` file claude is pointed at. Dropping it
+/// shuts the server down (abort) and deletes the temp file — so a reaped/finished suspension that
+/// owns this handle tears everything down.
+pub struct McpServer {
+    port: u16,
+    config_path: PathBuf,
+    pub calls: mpsc::UnboundedReceiver<PendingToolCall>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl McpServer {
+    pub async fn start(defs: Vec<ToolDef>) -> std::io::Result<Self> {
+        let (calls_tx, calls) = mpsc::unbounded_channel::<PendingToolCall>();
+        let template = McpBridge::new(defs, calls_tx);
+        let service = StreamableHttpService::new(
+            move || Ok(template.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let app = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let config_path = std::env::temp_dir()
+            .join(format!("llm-bridge-mcp-{}.json", uuid::Uuid::new_v4().simple()));
+        let body = serde_json::json!({
+            "mcpServers": { "llm-bridge": { "type": "http", "url": format!("http://127.0.0.1:{port}/mcp") } }
+        });
+        std::fs::write(&config_path, serde_json::to_vec(&body)?)?;
+
+        Ok(McpServer { port, config_path, calls, shutdown: Some(shutdown_tx), join })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        self.join.abort();
+        let _ = std::fs::remove_file(&self.config_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +163,20 @@ mod tests {
     use rmcp::model::CallToolRequestParams;
     use rmcp::{serve_client, serve_server};
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn server_binds_and_writes_strict_http_config() {
+        let server = McpServer::start(vec![def("search")]).await.unwrap();
+        assert!(server.port() > 0);
+        let cfg = std::fs::read_to_string(server.config_path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+        assert_eq!(v["mcpServers"]["llm-bridge"]["type"], "http");
+        assert_eq!(v["mcpServers"]["llm-bridge"]["url"], format!("http://127.0.0.1:{}/mcp", server.port()));
+        let path = server.config_path().to_path_buf();
+        drop(server); // RAII: shuts the server down and deletes the temp config
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!path.exists(), "temp mcp-config should be removed on drop");
+    }
 
     fn def(name: &str) -> ToolDef {
         ToolDef { kind: "function".into(), function: FunctionDef {
