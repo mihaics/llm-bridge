@@ -27,7 +27,8 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 - Real agentic behavior (file edits, command execution) under a sandboxed posture.
 - Multi-turn continuity that survives a stateless-looking HTTP API.
 - Stream the agent's tool activity to the client as visible-but-non-persisted progress.
-- Honor OpenAI `tools` (function calling) by bridging to MCP.
+- Honor OpenAI `tools` (function calling) by bridging to MCP, **for engines with safe
+  per-invocation MCP support** (claude now; codex pending the §9 spike; agy excluded).
 
 ### Non-goals
 - Reimplementing the agents or talking to model vendor APIs directly. We always shell out to
@@ -44,7 +45,7 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 | Scope | **Full agentic passthrough** — expose file edits, tool use, sessions |
 | Workspace selection | **Config-driven model list**: config registers named tuples, each published as a model in `/v1/models`; an OpenWebUI Pipe is the escape hatch for explicit per-request dirs |
 | Session continuity | **Content-hash resume** (hit = resume + last turn; **miss = fresh + full projected conversation**), keyed on a tool-aware conversation projection **+ a ModelEntry fingerprint** |
-| Progress output | **Per-client profile**: OpenWebUI → `reasoning_content` (visible, NOT persisted); strict OpenAI clients → standard chunks only (progress omitted). Final answer always → `content`. Streaming engines only |
+| Progress output | **Per-client profile**: OpenWebUI → `reasoning_content` (visible; excluded from our session hash + replay, so resume is unaffected regardless of client storage); strict OpenAI clients → standard chunks only (progress omitted). Final answer always → `content`. Streaming engines only |
 | OpenAI `tools` | **Bridge to MCP**; suspended sessions keyed by **`tool_call_id`** |
 | Safety posture | **Sandboxed full-auto**, with a hardened HTTP/host boundary (localhost default, **dedicated provisioned credential dirs**, env isolation, path canonicalization) |
 | Process model | **Re-spawn with native resume** (map session-key → CLI session id); the MCP suspended-session is the one stateful exception |
@@ -162,13 +163,19 @@ workspace, mode, permissions) feeds the session key (§4.5).
 ### 4.3 Turn Orchestrator
 For each request:
 1. Resolve `model` → `ModelEntry`. Unknown model → OpenAI error.
-2. **Tool-result routing.** If the request's `role:"tool"` messages match a live suspended
-   session, route there (§4.6). If the request **contains** `role:"tool"` messages but matches
-   **no** live suspension (e.g. a retry after the group timed out), it is **not** a normal turn —
-   return **`400`** (unknown/expired `tool_call_id`s) rather than falling through to session-key
-   computation, since a `tool`-terminated request has no final user turn to act on.
-3. Otherwise (a normal user turn): split `messages` into system prompt + conversation; compute
-   the **session key** (§4.5).
+2. **Tool-result routing — by message-list *shape*, not mere presence.** A request is a
+   tool-result follow-up **only if its trailing messages are a `role:"tool"` suffix** (one or
+   more `tool` results responding to the immediately preceding assistant `tool_calls`, with **no
+   user message after them**). Historical `tool` messages that appear *earlier* in the thread —
+   before a final user turn — are **not** a follow-up; that is an ordinary turn (this is the
+   normal case once a thread has any past tool use, since OpenWebUI resends full history).
+   - Tool-result suffix **matching** a live suspended group → route there (§4.6).
+   - Tool-result suffix matching **no** live suspension (e.g. retry after the group timed out) →
+     **`400`** (unknown/expired `tool_call_id`s); it has no final user turn to act on.
+3. Otherwise (the thread ends with a user turn — even if it contains historical tool exchanges):
+   split `messages` into system prompt + conversation; compute the **session key** (§4.5). The
+   session-key projection already folds in historical `tool_calls`/`tool` results, so past tool
+   use is part of the hash, not a routing trigger.
 4. Resolve session, select the engine, build the spawn command.
 5. If the request carries `tools`, stand up the MCP bridge (§4.6) and wire the CLI to it.
 6. Spawn via the Process Supervisor, consume normalized `AgentEvent`s, map events → OpenAI
@@ -376,9 +383,13 @@ file edits and command execution, the boundary is hardened on multiple axes:
   escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
 - **Per-engine sandbox is documented, not assumed uniform — and "full-auto" ≠ "full access":**
   auto-approve (no permission prompts) is separated from filesystem scope.
-  - **codex** has a real FS boundary: `workspace-write` auto-approves edits *inside* the
-    workspace while denying reads/writes outside it (including the cred dir). This is the
-    intended full-auto posture; `danger-full-access` is never used for request-driven runs.
+  - **codex** *can* provide a real FS boundary: `workspace-write` auto-approves edits *inside*
+    the workspace while denying reads/writes outside it (including the cred dir) — this is the
+    intended full-auto posture; `danger-full-access` is never used for request-driven runs. But
+    codex sandboxing is **platform-dependent** (Linux user-namespaces / bubblewrap). Verified on
+    the dev host (a write outside cwd is rejected "Read-only file system", `userns=1`, `bwrap`
+    present), but it **must not be assumed** — it is confirmed per-deployment by the startup
+    smoke check below.
   - **claude / agy** auto-approve via `--dangerously-skip-permissions` / `--sandbox`, which do
     **not** OS-confine the shell commands the agent spawns — a `bash` tool could read the cred
     dir. So for these engines, real confinement requires an **external OS sandbox**
@@ -388,16 +399,22 @@ file edits and command execution, the boundary is hardened on multiple axes:
   The config's `permissions` maps to the strongest available control per engine; the docs state
   each engine's actual guarantee (the sandbox strength is the *engine's* — or the host OS's —
   not ours).
-- **Startup validation ties config to posture.** The server refuses to start (clear message) on
-  unsafe combinations:
+- **Startup validation ties config to posture — and proves the sandbox actually runs.** At
+  startup, for every `mode: agentic` model the server runs a **sandbox smoke check** of that
+  model's *effective* sandbox (codex: a `codex sandbox` probe asserting a write outside the
+  workspace is denied; claude/agy with a `sandbox_backend`: a probe of that backend) and
+  **refuses to start** (clear message) if it doesn't actually confine. It also refuses on these
+  config-only unsafe combinations:
   - a claude/agy `mode: agentic` model with no `sandbox_backend` unless explicitly marked
     `trusted_caller_only: true` — prevents the config from *implying* confinement that isn't
-    there; and
+    there;
   - a claude/agy `mode: agentic` model authed by **API-key env var** with no `sandbox_backend`
-    (the key would leak into spawned shell tools — see env-auth restriction above).
-  When a `sandbox_backend` (bubblewrap/namespace/container) is configured, the engine runs inside
-  it and neither restriction applies. Codex `workspace-write` is self-confining and `text`
-  profiles run no tools, so both are exempt.
+    (the key would leak into spawned shell tools — see env-auth restriction above); and
+  - a **codex `mode: agentic` model whose sandbox smoke check fails** (platform lacks
+    userns/bwrap) unless marked `trusted_caller_only: true`. Codex is **not** blanket-exempt — it
+    is exempt from needing `sandbox_backend` *only when its native sandbox passes the smoke check*.
+  When a `sandbox_backend` is configured and its probe passes, the engine runs inside it. `text`
+  profiles run no tools and are exempt from the sandbox checks.
 - **`mode: text`** replicates the PoC: empty temp dir, all tools blocked — a safe pure-generator.
 
 ## 5. Data flow
@@ -496,12 +513,20 @@ everything else.
 - **Replay transcript renderer** tested over tool-role histories: asserts past user
   instructions are framed as read-only context and only the final user turn is the live
   instruction.
+- **Tool-routing by shape** tested: a thread that *ends* with a `role:"tool"` suffix routes to a
+  suspension (or `400` if none); a thread containing historical tool messages but **ending with a
+  user turn** is treated as a normal turn and hashed (not rejected) — guards the post-tool
+  follow-up regression.
+- **Startup sandbox smoke check** tested: a codex agentic model whose sandbox probe fails (or a
+  `sandbox_backend` probe that fails) blocks startup unless `trusted_caller_only`.
 - **End-to-end smoke** behind a feature flag that shells out to a real installed CLI (local,
   not CI).
 
 ## 9. Build sequence (ordered, all in v1)
 1. Scaffold, config loader, model registry, `/health` + `/v1/models`, localhost bind + auth,
-   **startup validation** (claude/agy agentic ⇒ `sandbox_backend` set or `trusted_caller_only`).
+   **startup validation**: per-engine config rules (claude/agy agentic ⇒ `sandbox_backend` or
+   `trusted_caller_only`; env-auth restriction) **and a sandbox smoke check** for every agentic
+   model's effective sandbox (incl. codex), refusing models whose sandbox can't actually confine.
 2. `Engine` enum + `FakeEngine`; Turn Orchestrator; non-streaming `/v1/chat/completions`.
 3. Process Supervisor (spawn, isolation/env scrub, timeout, concurrency, cancellation).
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
@@ -541,9 +566,12 @@ everything else.
   `~/.gemini` may not redirect to a service dir), and confirms MCP-off. If isolation can't be
   proven, agy is operator-login-only / single-tenant in v1.
 - **Credential exfiltration is the top security risk:** cred dirs must be outside the workspace,
-  FS-denied to model-executed tools, and scrubbed from tool-subprocess env. codex
-  `workspace-write` enforces this natively; claude/agy full-auto need an **external OS sandbox**
-  — without one they're trusted-caller-only.
+  FS-denied to model-executed tools, and (codex) scrubbed from tool-subprocess env. codex
+  `workspace-write` enforces this natively **when its platform sandbox runs**; claude/agy
+  full-auto need an **external OS sandbox** — without one they're trusted-caller-only.
+- **Codex sandbox is platform-dependent:** it relies on Linux user-namespaces / bubblewrap and
+  can be unavailable on a given host (the startup smoke check catches this and refuses the model
+  unless `trusted_caller_only`). Verified working on the dev host; re-verified per deployment.
 - **Replay-prompt safety:** the read-only transcript renderer must reliably stop old
   instructions from being re-executed; covered by tests over tool-role histories (§8).
 - **Credential provisioning is an operator step:** the dedicated per-engine config dirs must be
