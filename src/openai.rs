@@ -107,6 +107,34 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+// ---- Streaming chunk ----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: &'static str, // "chat.completion.chunk"
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkChoice {
+    pub index: u32,
+    pub delta: Delta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
 // ---- Error (OpenAI shape) ----
 
 #[derive(Debug, Clone, Serialize)]

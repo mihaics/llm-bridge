@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"sess-abc","cwd":"/tmp"}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"the user wants pong"}]},"session_id":"sess-abc"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"pong"}]},"session_id":"sess-abc"}
+{"type":"result","subtype":"success","is_error":false,"result":"pong","session_id":"sess-abc","stop_reason":"end_turn"}

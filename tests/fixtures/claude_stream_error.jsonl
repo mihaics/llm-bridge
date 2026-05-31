@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"sess-err"}
+{"type":"result","subtype":"error","is_error":true,"result":"context limit exceeded","session_id":"sess-err"}

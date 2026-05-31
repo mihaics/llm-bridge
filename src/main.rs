@@ -38,6 +38,10 @@ async fn main() -> anyhow::Result<()> {
         registry: Arc::new(Registry::new(cfg.models.clone())),
         bearer_token: cfg.server.bearer_token.clone(),
         runner,
+        sessions: Arc::new(llm_bridge::session::SessionStore::new()),
+        defaults: cfg.defaults.clone(),
+        progress_channel: cfg.server.progress_channel,
+        claude_config_dir: cfg.credentials.claude_config_dir.clone(),
     };
 
     let app = build_router(state);
