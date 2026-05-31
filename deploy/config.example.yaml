@@ -1,0 +1,61 @@
+## Template for the local OpenWebUI test stack (see deploy/README.md).
+## Copy to deploy/config.yaml and fill in your token + logged-in agent config dirs.
+## deploy/config.yaml is gitignored (it holds your local token + machine-specific paths).
+##
+## The shim runs ON THE HOST (it shells out to your logged-in `claude`/`codex`/`agy`);
+## OpenWebUI runs in Docker and reaches it via host.docker.internal.
+server:
+  # 0.0.0.0 so the OpenWebUI container can reach the host shim (host-gateway). A non-loopback
+  # bind REQUIRES a strong bearer_token (>=16 chars, not a placeholder). Keep this token in sync
+  # with deploy/.env (LLM_BRIDGE_TOKEN), which docker-compose.yml reads.
+  bind: "0.0.0.0:8090"            # 8090 to avoid colliding with anything already on 8088
+  bearer_token: "REPLACE-with-a-strong-token-min-16-chars"
+  progress_channel: reasoning_content
+
+defaults:
+  timeout_s: 600
+  max_concurrency: 4
+  sandbox_backend: none           # local single-user test box; agentic models use trusted_caller_only
+  # Non-secret vars the spawned CLIs need. USER helps some tools; XDG_RUNTIME_DIR +
+  # DBUS_SESSION_BUS_ADDRESS let `agy` reach the OS keyring (Secret Service) for its login.
+  # Do NOT add ANTHROPIC_API_KEY / GEMINI_API_KEY for a claude/agy agentic model without a
+  # sandbox_backend — validation rejects it (it would leak into model-run tool shells).
+  env_passthrough: ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+
+credentials:                      # your logged-in config dirs (the "local logged-in agents" bit)
+  claude_config_dir: ~/.claude    # CLAUDE_CONFIG_DIR for the logged-in claude (this box uses ~/.claude)
+  codex_home: ~/.codex            # CODEX_HOME for the logged-in codex
+  agy_config_dir: ~/.config/agy   # unused in v1 (agy reads the OS keyring) — kept for completeness
+
+models:
+  # Quick, side-effect-free smoke model: pure generator, all tools blocked.
+  - id: "claude-sonnet-text"
+    engine: claude
+    model: sonnet
+    mode: text
+
+  # Agentic models — each gets a throwaway git workspace under /tmp/llm-bridge-work
+  # (created + git-initialised by deploy/run-shim.sh).
+  - id: "claude-opus-agentic"
+    engine: claude
+    model: opus
+    workspace: /tmp/llm-bridge-work/repoA
+    mode: agentic
+    permissions: workspace-write
+    trusted_caller_only: true     # required for agentic when sandbox_backend: none
+
+  - id: "codex-agentic"
+    engine: codex
+    model: gpt-5
+    workspace: /tmp/llm-bridge-work/repoB
+    mode: agentic
+    permissions: workspace-write
+    trusted_caller_only: true
+
+  - id: "gemini-agentic"
+    engine: agy
+    model: gemini-2.5-pro
+    workspace: /tmp/llm-bridge-work/repoC
+    mode: agentic
+    permissions: workspace-write
+    trusted_caller_only: true

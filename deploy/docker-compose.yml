@@ -1,0 +1,33 @@
+## OpenWebUI, pre-pointed at the host-side llm-bridge shim.
+##
+## The shim is NOT containerised: it shells out to your logged-in `claude`/`codex`/`agy`,
+## which are bound to this host (versioned Node installs + plugins, the fnm node multishell
+## on PATH, and the OS keyring for agy). So we run the shim on the host (deploy/run-shim.sh)
+## and let this container reach it via host.docker.internal (host-gateway).
+##
+## Requires deploy/.env (copy from .env.example): LLM_BRIDGE_TOKEN must match server.bearer_token
+## in deploy/config.yaml. SHIM_PORT/OWUI_PORT default to 8090/3000.
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "${OWUI_PORT:-3000}:8080"
+    environment:
+      # Point OpenWebUI's OpenAI-compatible backend at the host shim.
+      - OPENAI_API_BASE_URL=http://host.docker.internal:${SHIM_PORT:-8090}/v1
+      # Must match server.bearer_token in deploy/config.yaml. Set LLM_BRIDGE_TOKEN in deploy/.env.
+      - OPENAI_API_KEY=${LLM_BRIDGE_TOKEN:?set LLM_BRIDGE_TOKEN in deploy/.env (see .env.example)}
+      # Don't probe a local Ollama; this stack only uses the shim.
+      - ENABLE_OLLAMA_API=false
+      # No OpenWebUI login for local testing (must be set on a fresh data volume).
+      - WEBUI_AUTH=false
+    extra_hosts:
+      # Lets the container resolve the host (Docker 20.10+ on Linux).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui:
