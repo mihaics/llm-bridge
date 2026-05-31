@@ -22,6 +22,7 @@ async fn claude_text_mode_returns_text() {
         resume: None,
         engine: llm_bridge::config::EngineKind::Claude,
         permissions: None,
+        mcp_config: None,
     };
     let passthrough: Vec<String> =
         ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER"].iter().map(|s| s.to_string()).collect();
@@ -51,7 +52,7 @@ async fn claude_stream_text_mode_yields_text() {
     let turn = Turn {
         system_prompt: None, user_prompt: "Reply with exactly: pong".into(),
         model: Some("sonnet".into()), workspace: None, mode: Mode::Text, resume: None,
-        engine: llm_bridge::config::EngineKind::Claude, permissions: None,
+        engine: llm_bridge::config::EngineKind::Claude, permissions: None, mcp_config: None,
     };
     let passthrough: Vec<String> = ["PATH","HOME","LANG","LC_ALL","TERM","USER"].iter().map(|s| s.to_string()).collect();
     let (cmd, stdin) = engine.build_stream_command(&turn, &passthrough);
@@ -80,7 +81,7 @@ async fn codex_text_mode_returns_text() {
     let turn = Turn {
         system_prompt: None, user_prompt: "Reply with exactly: pong".into(),
         model: None, workspace: None, mode: Mode::Text, resume: None,
-        engine: EngineKind::Codex, permissions: None,
+        engine: EngineKind::Codex, permissions: None, mcp_config: None,
     };
     let passthrough: Vec<String> = ["PATH","HOME","LANG","LC_ALL","TERM","USER"].iter().map(|s| s.to_string()).collect();
     let (cmd, stdin) = engine.build_stream_command(&turn, &passthrough);
@@ -109,7 +110,7 @@ async fn agy_text_mode_returns_text() {
     let turn = Turn {
         system_prompt: None, user_prompt: "Reply with exactly: pong".into(),
         model: None, workspace: None, mode: Mode::Text, resume: None,
-        engine: EngineKind::Agy, permissions: None,
+        engine: EngineKind::Agy, permissions: None, mcp_config: None,
     };
     let passthrough: Vec<String> = ["PATH","HOME","LANG","LC_ALL","TERM","USER"].iter().map(|s| s.to_string()).collect();
     let (cmd, stdin) = engine.build_stream_command(&turn, &passthrough);

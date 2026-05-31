@@ -154,6 +154,7 @@ pub fn run_request(
             resume: Some(sid.clone()),
             engine: entry.engine,
             permissions: entry.permissions.clone(),
+            mcp_config: None,
         },
         None => Turn {
             system_prompt: rendered.system_prompt.clone(),
@@ -164,6 +165,7 @@ pub fn run_request(
             resume: None,
             engine: entry.engine,
             permissions: entry.permissions.clone(),
+            mcp_config: None,
         },
     };
 

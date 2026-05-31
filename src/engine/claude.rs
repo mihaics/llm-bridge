@@ -48,6 +48,9 @@ impl ClaudeAdapter {
         if let Some(dir) = &self.config_dir {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
+        if let Some(mcp) = &turn.mcp_config {
+            cmd.arg("--mcp-config").arg(mcp).arg("--strict-mcp-config");
+        }
 
         match turn.mode {
             Mode::Text => {
@@ -175,6 +178,7 @@ mod tests {
             resume: resume.map(String::from),
             engine: crate::config::EngineKind::Claude,
             permissions: None,
+            mcp_config: None,
         }
     }
 
@@ -250,5 +254,16 @@ mod tests {
         let a = ClaudeAdapter::new("claude", None);
         assert!(a.parse_stream_line("not json").is_empty());
         assert!(a.parse_stream_line(r#"{"type":"rate_limit_event"}"#).is_empty());
+    }
+
+    #[test]
+    fn mcp_config_adds_strict_flags() {
+        let a = ClaudeAdapter::new("claude", None);
+        let mut t = turn(Mode::Agentic, Some("/work/repoA"), None);
+        t.mcp_config = Some(std::path::PathBuf::from("/tmp/mcp.json"));
+        let (cmd, _) = a.build_stream_command(&t, &[]);
+        let args = args(&cmd);
+        assert!(args.windows(2).any(|w| w == ["--mcp-config", "/tmp/mcp.json"]));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
     }
 }

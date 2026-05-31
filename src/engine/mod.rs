@@ -29,6 +29,8 @@ pub struct Turn {
     pub engine: EngineKind,
     /// The model's `permissions` string (drives codex `-s` sandbox level); `None` ⇒ engine default.
     pub permissions: Option<String>,
+    /// `Some(path)` to a per-request MCP config file → claude `--mcp-config <path> --strict-mcp-config`.
+    pub mcp_config: Option<PathBuf>,
 }
 
 /// Normalized engine output events.
@@ -158,7 +160,7 @@ mod tests {
         let t = Turn {
             system_prompt: None, user_prompt: "x".into(), model: None,
             workspace: None, mode: crate::config::Mode::Text, resume: Some("sid".into()),
-            engine: crate::config::EngineKind::Claude, permissions: None,
+            engine: crate::config::EngineKind::Claude, permissions: None, mcp_config: None,
         };
         assert_eq!(t.resume.as_deref(), Some("sid"));
     }
@@ -188,6 +190,7 @@ mod tests {
         let t = Turn {
             system_prompt: None, user_prompt: "x".into(), model: None, workspace: None,
             mode: crate::config::Mode::Text, resume: None, engine: EngineKind::Agy, permissions: None,
+            mcp_config: None,
         };
         assert_eq!(t.engine, EngineKind::Agy);
     }

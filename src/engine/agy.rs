@@ -74,6 +74,7 @@ mod tests {
             resume: resume.map(String::from),
             engine: EngineKind::Agy,
             permissions: None,
+            mcp_config: None,
         }
     }
     fn args(cmd: &tokio::process::Command) -> Vec<String> {
