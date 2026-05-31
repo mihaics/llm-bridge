@@ -18,6 +18,17 @@ impl ProcessSupervisor {
         ProcessSupervisor { sem: Arc::new(Semaphore::new(max_concurrency.max(1))) }
     }
 
+    /// Acquire an owned active-concurrency permit. Dropping it frees the slot (a parked suspension
+    /// drops its permit while idle; the resume path re-acquires). Used by the tools-turn path.
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.sem.clone().acquire_owned().await.expect("semaphore not closed")
+    }
+
+    /// Currently-free active slots (for tests/observability).
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
     /// Spawn a child and stream its stdout line-by-line as it arrives. The concurrency permit and
     /// the child are owned by the returned stream: dropping the stream frees the permit and kills
     /// the child (kill_on_drop). A per-stream deadline turns into a terminal TimedOut error.
@@ -123,5 +134,16 @@ mod tests {
         assert_eq!(results.iter().filter(|r| matches!(r, Ok(l) if l == "first")).count(), 1);
         assert!(results.iter().any(|r| matches!(r, Err(e) if e.kind() == std::io::ErrorKind::TimedOut)));
         assert!(!results.iter().any(|r| matches!(r, Ok(l) if l == "late")));
+    }
+
+    #[tokio::test]
+    async fn acquire_and_drop_releases_active_slot() {
+        let sup = ProcessSupervisor::new(1); // one active slot
+        let permit = sup.acquire().await;     // take it
+        assert_eq!(sup.available(), 0);
+        drop(permit);                          // park-release
+        assert_eq!(sup.available(), 1);
+        let _p2 = sup.acquire().await;         // resume re-acquires
+        assert_eq!(sup.available(), 0);
     }
 }
