@@ -80,6 +80,20 @@ impl Engine {
             Engine::Claude(a) => a.parse_output(stdout),
         }
     }
+
+    /// Build the streaming (stream-json) command + stdin payload.
+    pub fn build_stream_command(&self, turn: &Turn, env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
+        match self {
+            Engine::Claude(a) => a.build_stream_command(turn, env_passthrough),
+        }
+    }
+
+    /// Parse ONE line of streaming output into zero or more events.
+    pub fn parse_stream_line(&self, line: &str) -> Vec<AgentEvent> {
+        match self {
+            Engine::Claude(a) => a.parse_stream_line(line),
+        }
+    }
 }
 
 #[cfg(test)]
