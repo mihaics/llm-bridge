@@ -104,6 +104,8 @@ pub fn run_request(
             workspace: entry.workspace.clone(),
             mode: entry.mode,
             resume: Some(sid.clone()),
+            engine: entry.engine,
+            permissions: entry.permissions.clone(),
         },
         None => Turn {
             system_prompt: rendered.system_prompt.clone(),
@@ -112,6 +114,8 @@ pub fn run_request(
             workspace: entry.workspace.clone(),
             mode: entry.mode,
             resume: None,
+            engine: entry.engine,
+            permissions: entry.permissions.clone(),
         },
     };
 

@@ -1,9 +1,11 @@
 //! Engine abstraction. Production uses an enum (no `dyn`); each variant owns one CLI's quirks.
 //! Implements Claude via `--output-format stream-json` (events parsed line-by-line); the
 //! non-streaming endpoint aggregates the same event stream.
+pub mod agy;
 pub mod claude;
+pub mod codex;
 
-use crate::config::Mode;
+use crate::config::{EngineKind, Mode};
 use futures::Stream;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -21,8 +23,12 @@ pub struct Turn {
     pub model: Option<String>,
     pub workspace: Option<PathBuf>,
     pub mode: Mode,
-    /// `Some(session_id)` to resume an existing claude session; `None` for a fresh session.
+    /// `Some(session_id)` to resume an existing session; `None` for a fresh session.
     pub resume: Option<String>,
+    /// Which engine this turn runs on (drives per-engine dispatch in the runner).
+    pub engine: EngineKind,
+    /// The model's `permissions` string (drives codex `-s` sandbox level); `None` ⇒ engine default.
+    pub permissions: Option<String>,
 }
 
 /// Normalized engine output events.
@@ -56,22 +62,44 @@ pub enum EngineError {
     Parse(String),
 }
 
-/// Production dispatch enum. (Codex/Agy variants arrive in Phase 3.)
+/// Per-engine capabilities, independent of any adapter instance (so the runner/orchestrator can
+/// query caps without constructing an adapter). agy is non-streaming and its resume is gated off
+/// until the §9 spike proves session-id capture + credential isolation.
+pub fn caps_for(engine: EngineKind) -> Caps {
+    match engine {
+        EngineKind::Claude => Caps { streaming: true, resume_by_id: true, mcp_tools_phase1: false },
+        EngineKind::Codex => Caps { streaming: true, resume_by_id: true, mcp_tools_phase1: false },
+        EngineKind::Agy => Caps { streaming: false, resume_by_id: false, mcp_tools_phase1: false },
+    }
+}
+
+/// Production dispatch enum (no `dyn`); each variant owns one CLI's quirks.
 pub enum Engine {
     Claude(claude::ClaudeAdapter),
+    Codex(codex::CodexAdapter),
+    Agy(agy::AgyAdapter),
 }
 
 impl Engine {
-    pub fn caps(&self) -> Caps {
+    pub fn kind(&self) -> EngineKind {
         match self {
-            Engine::Claude(_) => Caps { streaming: true, resume_by_id: true, mcp_tools_phase1: false },
+            Engine::Claude(_) => EngineKind::Claude,
+            Engine::Codex(_) => EngineKind::Codex,
+            Engine::Agy(_) => EngineKind::Agy,
         }
     }
 
-    /// Build the streaming (stream-json) command + stdin payload.
+    pub fn caps(&self) -> Caps {
+        caps_for(self.kind())
+    }
+
+    /// Build the streaming command + stdin payload (claude feeds the prompt on stdin; codex/agy
+    /// pass it as the trailing positional argument and use no stdin).
     pub fn build_stream_command(&self, turn: &Turn, env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
         match self {
             Engine::Claude(a) => a.build_stream_command(turn, env_passthrough),
+            Engine::Codex(a) => a.build_stream_command(turn, env_passthrough),
+            Engine::Agy(a) => a.build_stream_command(turn, env_passthrough),
         }
     }
 
@@ -79,6 +107,8 @@ impl Engine {
     pub fn parse_stream_line(&self, line: &str) -> Vec<AgentEvent> {
         match self {
             Engine::Claude(a) => a.parse_stream_line(line),
+            Engine::Codex(a) => a.parse_stream_line(line),
+            Engine::Agy(a) => a.parse_stream_line(line),
         }
     }
 }
@@ -112,7 +142,37 @@ mod tests {
         let t = Turn {
             system_prompt: None, user_prompt: "x".into(), model: None,
             workspace: None, mode: crate::config::Mode::Text, resume: Some("sid".into()),
+            engine: crate::config::EngineKind::Claude, permissions: None,
         };
         assert_eq!(t.resume.as_deref(), Some("sid"));
+    }
+
+    #[test]
+    fn caps_per_engine() {
+        use crate::config::EngineKind;
+        let claude = caps_for(EngineKind::Claude);
+        assert!(claude.streaming && claude.resume_by_id && !claude.mcp_tools_phase1);
+        let codex = caps_for(EngineKind::Codex);
+        assert!(codex.streaming && codex.resume_by_id && !codex.mcp_tools_phase1);
+        let agy = caps_for(EngineKind::Agy);
+        assert!(!agy.streaming && !agy.resume_by_id && !agy.mcp_tools_phase1); // non-streaming, resume gated off
+    }
+
+    #[test]
+    fn engine_kind_reports_variant() {
+        use crate::config::EngineKind;
+        let e = Engine::Codex(crate::engine::codex::CodexAdapter::new("codex", None));
+        assert_eq!(e.kind(), EngineKind::Codex);
+        assert!(e.caps().streaming);
+    }
+
+    #[test]
+    fn turn_carries_engine() {
+        use crate::config::EngineKind;
+        let t = Turn {
+            system_prompt: None, user_prompt: "x".into(), model: None, workspace: None,
+            mode: crate::config::Mode::Text, resume: None, engine: EngineKind::Agy, permissions: None,
+        };
+        assert_eq!(t.engine, EngineKind::Agy);
     }
 }

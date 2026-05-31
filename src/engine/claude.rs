@@ -173,6 +173,8 @@ mod tests {
             workspace: ws.map(PathBuf::from),
             mode,
             resume: resume.map(String::from),
+            engine: crate::config::EngineKind::Claude,
+            permissions: None,
         }
     }
 

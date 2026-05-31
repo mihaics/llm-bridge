@@ -20,6 +20,8 @@ async fn claude_text_mode_returns_text() {
         workspace: None,
         mode: Mode::Text,
         resume: None,
+        engine: llm_bridge::config::EngineKind::Claude,
+        permissions: None,
     };
     let passthrough: Vec<String> =
         ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER"].iter().map(|s| s.to_string()).collect();
@@ -49,6 +51,7 @@ async fn claude_stream_text_mode_yields_text() {
     let turn = Turn {
         system_prompt: None, user_prompt: "Reply with exactly: pong".into(),
         model: Some("sonnet".into()), workspace: None, mode: Mode::Text, resume: None,
+        engine: llm_bridge::config::EngineKind::Claude, permissions: None,
     };
     let passthrough: Vec<String> = ["PATH","HOME","LANG","LC_ALL","TERM","USER"].iter().map(|s| s.to_string()).collect();
     let (cmd, stdin) = engine.build_stream_command(&turn, &passthrough);
