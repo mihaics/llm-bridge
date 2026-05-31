@@ -5,16 +5,20 @@ server:
 defaults:
   timeout_s: 600
   max_concurrency: 4
-  sandbox_backend: none           # Phase 1 supports only `none`; others are Phase 3
-  env_passthrough: ["PATH", "HOME", "LANG", "LC_ALL", "TERM"]   # all other env vars are scrubbed from claude
-credentials:
-  claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR (leading ~ is expanded). Provision once:
-                                                 #   CLAUDE_CONFIG_DIR=~/.llm-bridge/cred/claude claude login
+  sandbox_backend: none           # none | bubblewrap (implemented) | container (NOT yet implemented).
+                                  # `bubblewrap` requires `bwrap` on the host and is validated at startup
+                                  # by write- + read-denial canary probes; it lets agentic models run
+                                  # WITHOUT trusted_caller_only.
+  env_passthrough: ["PATH", "HOME", "LANG", "LC_ALL", "TERM"]   # all other env vars are scrubbed.
+                                  # Do NOT add ANTHROPIC_API_KEY / GEMINI_API_KEY for a claude/agy
+                                  # AGENTIC model unless sandbox_backend is set (it leaks to tool shells).
+credentials:                      # dedicated, persistent, operator-provisioned per-engine dirs
+  claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR; provision: CLAUDE_CONFIG_DIR=… claude login
+  codex_home: ~/.llm-bridge/cred/codex           # CODEX_HOME (persistent → enables resume); CODEX_HOME=… codex login
+  agy_config_dir: ~/.llm-bridge/cred/gemini      # UNUSED in v1: agy has no config-dir flag + reads the OS
+                                                 # keyring at runtime, so agy runs under the operator's own
+                                                 # login (single-tenant); reserved for the future agy spike
 models:
-  - id: "claude-sonnet-text"
-    engine: claude
-    model: sonnet
-    mode: text                    # PoC-style pure generator: all tools blocked
   - id: "claude-opus-repoA"
     engine: claude
     model: opus
@@ -22,3 +26,21 @@ models:
     mode: agentic
     permissions: workspace-write
     trusted_caller_only: true     # REQUIRED for agentic when sandbox_backend: none
+  - id: "codex-gpt5-repoB"
+    engine: codex
+    model: gpt-5
+    workspace: /work/repoB
+    mode: agentic
+    permissions: workspace-write  # codex confines WRITES natively, but still reads the cred dir,
+    trusted_caller_only: true     # so it also needs trusted_caller_only (or a sandbox_backend)
+  - id: "agy-gemini-repoC"
+    engine: agy
+    model: gemini-2.5-pro
+    workspace: /work/repoC
+    mode: agentic
+    permissions: workspace-write  # agy: coarse boolean sandbox; stateless replay (no resume) in v1
+    trusted_caller_only: true
+  - id: "claude-sonnet-text"
+    engine: claude
+    model: sonnet
+    mode: text                    # PoC-style pure generator: all tools blocked
