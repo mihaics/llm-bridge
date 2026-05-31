@@ -1281,6 +1281,10 @@ git commit -m "feat: bubblewrap sandbox wrapping + write/read canary probes (pur
 
 ## Task 6: Validation rewrite — lift the ceiling, env-auth restriction, refuse `container`
 
+> **Carried-over from Task 4 code review (do these here):**
+> - Add `impl SandboxBackend { pub fn as_str(&self) -> &'static str }` in `src/config.rs` returning the canonical lowercase name (`"none"`/`"bubblewrap"`/`"container"`, matching its `rename_all = "lowercase"`), and replace the fragile `format!("{:?}", state.defaults.sandbox_backend).to_lowercase()` in `src/http.rs` `chat_completions` with `state.defaults.sandbox_backend.as_str()`. The session-key fingerprint must stay stable against future enum renames/multi-word variants. (`as_str` is also handy for the validation messages below.)
+> - The stale "Phase 1" error strings and the test names `sandbox_backend_other_than_none_is_refused_in_phase1` / `non_claude_engine_is_refused_in_phase1` are replaced wholesale by this task's rewrite (below) — no separate action needed beyond following the steps.
+
 Replaces the Phase-1/2 ceiling. Codex and Agy engines are now allowed; `bubblewrap` is allowed (the real canary probes run at startup in `main`, Task 7); `container` is **refused as not-yet-implemented**. Adds the **API-key-env restriction**: a claude/agy *agentic* model with no `sandbox_backend` must not pass an API-key var through `env_passthrough` (it would leak into model-run tool shells; only codex scrubs). When `sandbox_backend` is set, `trusted_caller_only` is no longer required (the sandbox provides confinement, verified by the startup probes).
 
 **Files:** Modify `src/validate.rs`.
