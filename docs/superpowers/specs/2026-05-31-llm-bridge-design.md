@@ -46,7 +46,7 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 | Workspace selection | **Config-driven model list**: config registers named tuples, each published as a model in `/v1/models`; an OpenWebUI Pipe is the escape hatch for explicit per-request dirs |
 | Session continuity | **Content-hash resume** (hit = resume + last turn; **miss = fresh + full projected conversation**), keyed on a tool-aware conversation projection **+ a ModelEntry fingerprint** |
 | Progress output | **Per-client profile**: OpenWebUI → `reasoning_content` (visible; excluded from our session hash + replay, so resume is unaffected regardless of client storage); strict OpenAI clients → standard chunks only (progress omitted). Final answer always → `content`. Streaming engines only |
-| OpenAI `tools` | **Bridge to MCP**; suspended sessions keyed by **`tool_call_id`** |
+| OpenAI `tools` | **Bridge to MCP**; suspended sessions are a **turn-level tool-call group** (all of the turn's `tool_call_id`s); follow-up must complete the whole group |
 | Safety posture | **Sandboxed full-auto**, with a hardened HTTP/host boundary (localhost default, **dedicated provisioned credential dirs**, env isolation, path canonicalization) |
 | Process model | **Re-spawn with native resume** (map session-key → CLI session id); the MCP suspended-session is the one stateful exception |
 | Build scope | **All in from v1** — MCP bridge is core, not deferred (build is ordered, not phased) |
@@ -108,11 +108,14 @@ deliberate scope decision with direct consequences:
   non-issue **by design** — but it is called out so the limitation is explicit. Multi-tenant use
   is **not supported** without future work (a trusted reverse-proxy identity header namespacing
   the key is the intended hook, left as a documented extension point, not built in v1).
-- **claude/agy agentic models are trusted-caller-only.** Per §4.8, their auto-approve does not
-  OS-confine spawned shell tools, so without an external OS sandbox a caller could read the
-  credential dir. Under the trusted model this is **accepted and documented**, not enforced
-  away; an optional `sandbox_backend` (§6) is offered for defense-in-depth but not required in
-  single-user mode. Codex `workspace-write` remains a real boundary regardless.
+- **All agentic models are trusted-caller-only in v1.** Per §4.8, *no* native engine sandbox
+  prevents a model-run tool from **reading** the credential dir — verified: codex reads
+  `~/.codex/auth.json` (it confines writes, not reads); claude/agy are unconfined. So credential
+  read-secrecy is **accepted and documented** under the trusted model, enforced via
+  `trusted_caller_only: true` on every agentic model. An optional `sandbox_backend` (§6),
+  validated by the startup read-denial canary, is the defense-in-depth path that drops the
+  trusted assumption — not required in single-user mode. Codex's `workspace-write` still gives
+  real *write*-confinement regardless (a bonus, not credential secrecy).
 
 The deployment docs must state the trusted-use assumption prominently (bind localhost, front
 with a trusted proxy if remote).
@@ -133,7 +136,7 @@ with a trusted proxy if remote).
 ├──────────────┬───────────────────────┬───────────────────────┤
 │ Session Store│ Engine (enum dispatch) │ MCP Tool Bridge        │
 │ key→cli sid  │ Claude · Codex · Agy   │ rmcp server + suspend  │
-│ (sled/disk)  │ spawn/flags/parse      │ keyed by tool_call_id  │
+│ (sled/disk)  │ spawn/flags/parse      │ tool-call group        │
 ├──────────────┴───────────────────────┴───────────────────────┤
 │ Process Supervisor  tokio spawn · timeouts · concurrency cap  │
 │ Observability       tracing, request ids, per-turn logs       │
@@ -261,12 +264,16 @@ regardless of profile.
   `tool_call_id` linkage prevents post-tool conversations from colliding or resuming the wrong
   native session (otherwise two threads that differ only in tool activity hash identically).
 - **Key** = hash of (a) the projection of the **prefix** (all messages except the final user
-  turn), (b) the **ModelEntry fingerprint** (engine, model, workspace, mode, permissions), and
-  (c) a **tool-config fingerprint** — normalized `tools` definitions + `tool_choice`. The tool
-  fingerprint matters because the available tool set is part of the agent's environment: two
-  identical conversations with different `tools` must **not** resume the same native session.
-  Equivalently, native resume is disabled whenever the tool config differs from the resumed
-  session's.
+  turn), (b) the **ModelEntry fingerprint** (engine, model, workspace, mode, permissions), (c) a
+  **tool-config fingerprint** — normalized `tools` definitions + `tool_choice`, and (d) the
+  **effective system/developer instruction fingerprint** — the normalized system/developer prompt
+  the turn would run under (the registry/config prompt plus any client `system`/`developer`
+  message). (c) matters because the available tool set is part of the agent's environment; (d)
+  matters because the system prompt is established when a native session is *created* — if the
+  client changes it for the same visible conversation, resuming the old session would run under
+  stale instructions. So two identical conversations with different tools **or** different system
+  prompts must **not** resume the same native session; equivalently, native resume is disabled
+  whenever either fingerprint differs from the resumed session's.
 - Lookup `key → CliSessionId`:
   - **Hit:** spawn with the engine's resume flag and feed **only the new user turn** (the CLI
     already holds the prior context on disk).
@@ -367,54 +374,51 @@ file edits and command execution, the boundary is hardened on multiple axes:
   configured `sandbox_backend` proves the tool subprocess env is scrubbed. Startup validation
   (§4.8 below, §9) rejects the unsafe combination. Codex agentic and all `text` profiles may use
   env keys (codex scrubs; text profiles run no tools).
-- **Credential dirs must be unreadable by model-executed tools.** The service credential dirs
-  hold real secrets (Claude's `CLAUDE_CONFIG_DIR` stores credentials, session history, settings,
-  plugins; `CODEX_HOME` likewise). Since the agent runs shell/file tools, a request could
-  otherwise read and exfiltrate them. Rule, enforced two ways: (1) credential dirs live
-  **outside any workspace** and the **sandbox filesystem policy denies read** of them — so
-  agentic models run at `read-only`/`workspace-write`, **never** `danger-full-access` /
-  `--dangerously-skip-permissions` unless an external OS sandbox already isolates the cred dir;
-  and (2) secrets are kept out of the tool subprocess environment where the engine allows it —
-  codex via `shell_environment_policy`, others via the configured `sandbox_backend`. Because
-  **claude/agy expose no per-tool env scrubbing**, claude/agy agentic rely on **file-based auth +
-  FS denial** of the cred dir rather than env (hence the API-key env restriction above); their
-  env cannot be assumed scrubbed without an external sandbox.
+- **Credential read-denial is NOT provided by the native engine sandboxes.** The service
+  credential dirs hold real secrets (`CLAUDE_CONFIG_DIR` stores credentials/session history;
+  `CODEX_HOME/auth.json` likewise). **Verified on the dev host: codex's sandbox denies *writes*
+  outside the workspace but freely *reads* anywhere — it read `~/.codex/auth.json` and a planted
+  canary.** claude/agy native auto-approve doesn't confine spawned shells at all. So
+  *credential/secret read-denial* is a guarantee **none of the native sandboxes give**; it is
+  provided only by an **external `sandbox_backend`** that hides/denies the cred dir (and other
+  secret paths), validated at startup by the **canary read-denial probe** (below). Env-based
+  secrets are additionally worse (inherited by child shells; only codex `shell_environment_policy`
+  strips them — hence the API-key env restriction above), but on-disk auth is readable regardless,
+  so file-based auth still depends on read-denial. Under the **single-user/trusted** model (§3.3)
+  the read-exfiltration risk is **accepted and documented** (the trusted caller owns the creds);
+  `sandbox_backend` is the path to drop that assumption.
 - **Workspace confinement:** canonicalize the configured workspace path, reject symlinks that
   escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
-- **Per-engine sandbox is documented, not assumed uniform — and "full-auto" ≠ "full access":**
-  auto-approve (no permission prompts) is separated from filesystem scope.
-  - **codex** *can* provide a real FS boundary: `workspace-write` auto-approves edits *inside*
-    the workspace while denying reads/writes outside it (including the cred dir) — this is the
-    intended full-auto posture; `danger-full-access` is never used for request-driven runs. But
-    codex sandboxing is **platform-dependent** (Linux user-namespaces / bubblewrap). Verified on
-    the dev host (a write outside cwd is rejected "Read-only file system", `userns=1`, `bwrap`
-    present), but it **must not be assumed** — it is confirmed per-deployment by the startup
-    smoke check below.
-  - **claude / agy** auto-approve via `--dangerously-skip-permissions` / `--sandbox`, which do
-    **not** OS-confine the shell commands the agent spawns — a `bash` tool could read the cred
-    dir. So for these engines, real confinement requires an **external OS sandbox**
-    (bubblewrap / namespaces / container) that denies the cred dir and non-workspace paths.
-    Without it, claude/agy agentic models are only safe for trusted callers; this is documented
-    as the weaker posture.
-  The config's `permissions` maps to the strongest available control per engine; the docs state
-  each engine's actual guarantee (the sandbox strength is the *engine's* — or the host OS's —
-  not ours).
-- **Startup validation ties config to posture — and proves the sandbox actually runs.** At
-  startup, for every `mode: agentic` model the server runs a **sandbox smoke check** of that
-  model's *effective* sandbox (codex: a `codex sandbox` probe asserting a write outside the
-  workspace is denied; claude/agy with a `sandbox_backend`: a probe of that backend) and
-  **refuses to start** (clear message) if it doesn't actually confine. It also refuses on these
-  config-only unsafe combinations:
-  - a claude/agy `mode: agentic` model with no `sandbox_backend` unless explicitly marked
-    `trusted_caller_only: true` — prevents the config from *implying* confinement that isn't
-    there;
-  - a claude/agy `mode: agentic` model authed by **API-key env var** with no `sandbox_backend`
-    (the key would leak into spawned shell tools — see env-auth restriction above); and
-  - a **codex `mode: agentic` model whose sandbox smoke check fails** (platform lacks
-    userns/bwrap) unless marked `trusted_caller_only: true`. Codex is **not** blanket-exempt — it
-    is exempt from needing `sandbox_backend` *only when its native sandbox passes the smoke check*.
-  When a `sandbox_backend` is configured and its probe passes, the engine runs inside it. `text`
-  profiles run no tools and are exempt from the sandbox checks.
+- **Two distinct guarantees — "full-auto" ≠ "full access", and write-confinement ≠ read-secrecy:**
+  - **(A) Write-confinement** (the agent can't damage/write outside its workspace): **codex
+    `workspace-write` provides this natively** (verified: a write outside cwd → "Read-only file
+    system"), though it is platform-dependent (Linux userns/bwrap) and confirmed per-deployment by
+    the smoke check. **claude/agy provide none** (`--dangerously-skip-permissions` / `--sandbox`
+    don't OS-confine spawned shells); they need an external `sandbox_backend` for (A).
+  - **(B) Read/credential-secrecy** (model tools can't read secret files): **no native sandbox
+    provides this** — codex reads anywhere (verified), claude/agy unconfined. (B) requires an
+    external `sandbox_backend`, or is accepted under the single-user/trusted model.
+  `danger-full-access` / unconfined `--dangerously-skip-permissions` are never used for
+  request-driven runs except under an external sandbox. The config's `permissions` maps to the
+  strongest available control per engine; the docs state each engine's actual guarantee per (A)/(B)
+  (the strength is the *engine's* — or the host OS sandbox's — not ours).
+- **Startup validation ties config to posture — and probes the *actual* guarantees.** At startup,
+  for every `mode: agentic` model the server runs **two canary probes** of the model's *effective*
+  sandbox: a **write-denial** probe (write outside the workspace must fail) and a
+  **read-denial** probe (plant a canary secret beside the cred dir; the sandboxed process must
+  **not** be able to read it). It **refuses to start** (clear message) unless the model's posture
+  is internally consistent:
+  - **`sandbox_backend` configured:** both probes must pass, else refuse. This is the only way to
+    run agentic models **without** `trusted_caller_only` (drops the single-user assumption).
+  - **No `sandbox_backend`:** the model **must** be marked `trusted_caller_only: true`
+    (the v1 single-user default), because no native sandbox passes the read-denial probe — codex
+    passes write-denial but **fails read-denial** (reads the cred dir), and claude/agy fail both.
+    Refuse otherwise, so the config never *implies* confinement it doesn't have.
+  - **API-key env auth** on a claude/agy agentic model still additionally requires a
+    `sandbox_backend` (env leaks to child shells; see env-auth restriction above).
+  `text` profiles run no tools and are exempt. (Net effect in v1's single-user model: agentic
+  models run `trusted_caller_only: true`; codex still earns real *write*-confinement, which the
+  write-denial probe records.)
 - **`mode: text`** replicates the PoC: empty temp dir, all tools blocked — a safe pure-generator.
 
 ## 5. Data flow
@@ -452,8 +456,9 @@ defaults:
   max_suspended_sessions: 16           # cap on parked tool-call processes (excess -> 503)
   session_store: { backend: sled, path: ~/.llm-bridge/sessions, ttl_h: 24 }
   env_passthrough: ["PATH", "LANG"]    # everything else scrubbed from spawned CLIs
-  sandbox_backend: none                # none | bubblewrap | container — required for claude/agy
-                                       # agentic unless that model sets trusted_caller_only: true
+  sandbox_backend: none                # none | bubblewrap | container. Required to run ANY agentic
+                                       # model without trusted_caller_only (only an external sandbox
+                                       # passes the read-denial canary; no native sandbox does)
 credentials:                    # dedicated, persistent, operator-provisioned per-engine dirs
   claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR
   codex_home: ~/.llm-bridge/cred/codex           # CODEX_HOME (persistent — enables resume)
@@ -466,14 +471,14 @@ models:
     workspace: /work/repoA       # canonicalized; symlink-escapes rejected
     mode: agentic                # agentic | text
     permissions: workspace-write # mapped to the strongest equivalent per engine
-    trusted_caller_only: true    # REQUIRED for claude/agy agentic when sandbox_backend: none
-                                 # (their auto-approve doesn't OS-confine spawned shell tools)
+    trusted_caller_only: true    # REQUIRED for any agentic model when sandbox_backend: none
   - id: "codex-gpt5-repoB"
     engine: codex
     model: gpt-5
     workspace: /work/repoB
     mode: agentic
-    permissions: workspace-write
+    permissions: workspace-write # codex confines WRITES natively, but still reads the cred dir,
+    trusted_caller_only: true    # so it also needs this (or a sandbox_backend) — see §4.8
   - id: "claude-sonnet-textgen"
     engine: claude
     model: sonnet
@@ -508,8 +513,8 @@ everything else.
   `503`. Plus a **concurrency test** asserting two simultaneous tool-bearing requests get isolated
   per-process MCP wiring (distinct temp configs / sockets, no cross-talk).
 - **Session key** tested for fingerprint sensitivity (same id + changed workspace ⇒ different
-  key; same conversation + different `tools`/`tool_choice` ⇒ different key) and prefix-rotation
-  correctness.
+  key; same conversation + different `tools`/`tool_choice` ⇒ different key; same conversation +
+  changed **system/developer prompt** ⇒ different key) and prefix-rotation correctness.
 - **Replay transcript renderer** tested over tool-role histories: asserts past user
   instructions are framed as read-only context and only the final user turn is the live
   instruction.
@@ -517,16 +522,18 @@ everything else.
   suspension (or `400` if none); a thread containing historical tool messages but **ending with a
   user turn** is treated as a normal turn and hashed (not rejected) — guards the post-tool
   follow-up regression.
-- **Startup sandbox smoke check** tested: a codex agentic model whose sandbox probe fails (or a
-  `sandbox_backend` probe that fails) blocks startup unless `trusted_caller_only`.
+- **Startup sandbox canary probes** tested: both write-denial and **read-denial** (canary secret
+  beside the cred dir) are exercised; a model with `sandbox_backend` failing either probe blocks
+  startup; a model with no `sandbox_backend` and no `trusted_caller_only` is refused (codex
+  included, since it passes write-denial but fails read-denial).
 - **End-to-end smoke** behind a feature flag that shells out to a real installed CLI (local,
   not CI).
 
 ## 9. Build sequence (ordered, all in v1)
 1. Scaffold, config loader, model registry, `/health` + `/v1/models`, localhost bind + auth,
-   **startup validation**: per-engine config rules (claude/agy agentic ⇒ `sandbox_backend` or
-   `trusted_caller_only`; env-auth restriction) **and a sandbox smoke check** for every agentic
-   model's effective sandbox (incl. codex), refusing models whose sandbox can't actually confine.
+   **startup validation**: every agentic model ⇒ `sandbox_backend` or `trusted_caller_only`
+   (no native sandbox passes read-denial); env-auth restriction; **write- and read-denial canary
+   probes** of the effective sandbox, refusing inconsistent postures.
 2. `Engine` enum + `FakeEngine`; Turn Orchestrator; non-streaming `/v1/chat/completions`.
 3. Process Supervisor (spawn, isolation/env scrub, timeout, concurrency, cancellation).
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
@@ -543,10 +550,11 @@ everything else.
    `-c mcp_servers.*` — validate in spike, gate if it fails; agy off) + **turn-level suspended
    groups** (all-or-`409`, unknown/expired→`400`, `tool_result_timeout_s`, `max_suspended_sessions`
    accounting).
-9. Credential-provisioning + security/sandbox hardening (cred dirs outside workspace, FS-denied to
-   tools; codex env-scrub via `shell_environment_policy`; **API-key env disallowed for claude/agy
-   agentic** without a sandbox; external OS sandbox for claude/agy full-auto), startup-validation
-   rules, per-engine sandbox docs, client-profile wiring, observability polish, e2e smoke.
+9. Credential-provisioning + security/sandbox hardening (cred dirs outside workspace; **no native
+   sandbox passes read-denial**, so all agentic models are `trusted_caller_only` or run under a
+   `sandbox_backend`; codex env-scrub via `shell_environment_policy`; **API-key env disallowed for
+   claude/agy agentic** without a sandbox), write+read canary validation, per-engine sandbox docs,
+   client-profile wiring, observability polish, e2e smoke.
 
 ## 10. Open questions / risks
 - **Per-process MCP injection must be race-free:** claude is confirmed (`--mcp-config
@@ -565,13 +573,15 @@ everything else.
 - **agy spike covers three things:** session-id capture, credential/config isolation (keyring +
   `~/.gemini` may not redirect to a service dir), and confirms MCP-off. If isolation can't be
   proven, agy is operator-login-only / single-tenant in v1.
-- **Credential exfiltration is the top security risk:** cred dirs must be outside the workspace,
-  FS-denied to model-executed tools, and (codex) scrubbed from tool-subprocess env. codex
-  `workspace-write` enforces this natively **when its platform sandbox runs**; claude/agy
-  full-auto need an **external OS sandbox** — without one they're trusted-caller-only.
-- **Codex sandbox is platform-dependent:** it relies on Linux user-namespaces / bubblewrap and
-  can be unavailable on a given host (the startup smoke check catches this and refuses the model
-  unless `trusted_caller_only`). Verified working on the dev host; re-verified per deployment.
+- **Credential exfiltration is the top security risk — and NO native sandbox stops it.** Verified:
+  codex's sandbox reads `~/.codex/auth.json` and any planted secret (it confines writes, not
+  reads); claude/agy are unconfined. So credential read-denial requires an **external
+  `sandbox_backend`** (validated by the startup read-denial canary) or is **accepted under the
+  single-user/trusted model** (v1 default: agentic models run `trusted_caller_only`).
+- **Codex sandbox is platform-dependent and read-permissive:** its *write*-confinement relies on
+  Linux user-namespaces / bubblewrap (can be unavailable on a host; caught by the write-denial
+  canary) and it does **not** confine reads at all. Verified write-confining + read-permissive on
+  the dev host; re-verified per deployment.
 - **Replay-prompt safety:** the read-only transcript renderer must reliably stop old
   instructions from being re-executed; covered by tests over tool-role histories (§8).
 - **Credential provisioning is an operator step:** the dedicated per-engine config dirs must be
