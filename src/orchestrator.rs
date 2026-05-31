@@ -449,6 +449,8 @@ pub async fn run_tools_turn(
         if !saw_terminal {
             yield AgentEvent::Done { finish_reason: "stop".to_string() };
         }
+        // NOTE: no session is stored after a tools continuation — resume-with-tools is out of
+        // scope for v1, so a resumed tools turn always takes the full-transcript miss path.
         drop(server); // tear down the MCP server + temp config once claude is done
     });
 

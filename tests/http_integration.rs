@@ -35,6 +35,10 @@ fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
         credentials: Credentials::default(),
         suspended: Arc::new(SuspendedSessions::new(8)),
         tool_result_timeout: Duration::from_secs(120),
+        // Intentionally independent of the runner: FakeRunner bypasses the supervisor, so no
+        // permits flow through it. In `main` ONE ProcessSupervisor is cloned into both the runner
+        // and AppState (verified by the Arc::ptr_eq test in process.rs). A future hermetic
+        // happy-path tools-turn test would need to share a real runner's supervisor here.
         supervisor: ProcessSupervisor::new(4),
     }
 }
