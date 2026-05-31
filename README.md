@@ -24,13 +24,12 @@ Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_to
   drops the `trusted_caller_only` requirement. Bind localhost; front with a trusted proxy if remote.
   Non-loopback binds require a strong, non-default token.
 
-## Status (Phase 3)
+## Status (Phase 4a)
 - ✅ `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` — streaming (SSE) and non-streaming
-- ✅ **Three engines**: `claude` (stream-json), `codex` (`exec --json`, sandbox levels, persistent `CODEX_HOME`), `agy` (`--print`, stateless replay)
-- ✅ **Session resume** for claude + codex (content-hash key → engine resume); **agy is stateless** (resume gated off pending the agy spike — single-tenant, operator login)
-- ✅ **`sandbox_backend: bubblewrap`** — workspace-only writes + cred-dir-only reads, validated at startup by **write- + read-denial canary probes**; agentic models then run without `trusted_caller_only`
-- ✅ API-key-env restriction (claude/agy agentic without a sandbox refuse a passed API key); progress profiles; global `max_concurrency`
-- ⛔ `tools` → 400 (Phase 4); `sandbox_backend: container` → refused at startup (not yet implemented)
+- ✅ Three engines: `claude` (stream-json), `codex` (`exec --json`), `agy` (`--print`); session resume for claude+codex; bubblewrap sandbox + startup canary probes
+- ✅ **OpenAI `tools` protocol core**: `tool_calls` out (aggregate + SSE `delta.tool_calls`), tool-result follow-up **routing by message shape**, and the **suspended tool-call registry** (turn-level groups: all-or-`409`, duplicate/unknown→`400`, idle-reap, `max_suspended_sessions`→`503`)
+- ⛔ The **live MCP bridge** (in-process `rmcp` server + claude `--mcp-config` wiring) lands in **Phase 4b** — until then `tools` to claude → `400 "Phase 4b"`; `tools` to codex/agy → `400 "not supported for engine …"` (codex gated pending the §9 spike; agy never)
+- ⛔ `sandbox_backend: container` → refused at startup (not yet implemented)
 
 ## Test
 ```bash
