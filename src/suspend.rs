@@ -150,6 +150,11 @@ impl SuspendedSessions {
     pub fn live_count(&self) -> usize {
         self.inner.lock().unwrap().groups.len()
     }
+
+    /// True when the suspended pool is at `max_suspended_sessions` (a new suspension would be refused).
+    pub fn is_full(&self) -> bool {
+        self.inner.lock().unwrap().groups.len() >= self.max
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +228,15 @@ mod tests {
         s.register(p1, continuation()).unwrap();
         let (p2, _r2) = channels(&["b"]);
         assert_eq!(s.register(p2, continuation()).unwrap_err(), RegisterError::Full);
+    }
+
+    #[test]
+    fn is_full_reflects_capacity() {
+        let s = SuspendedSessions::new(1);
+        assert!(!s.is_full(), "empty pool should not be full");
+        let (pairs, _rxs) = channels(&["call_a"]);
+        s.register(pairs, continuation()).unwrap();
+        assert!(s.is_full(), "pool at max should be full");
     }
 
     #[tokio::test]

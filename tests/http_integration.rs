@@ -3,6 +3,7 @@ use llm_bridge::config::{Credentials, Defaults, EngineKind, Mode, ModelEntry, Pr
 use llm_bridge::engine::{AgentEvent, EventStream, Turn};
 use llm_bridge::http::{build_router, AppState};
 use llm_bridge::orchestrator::TurnRunner;
+use llm_bridge::process::ProcessSupervisor;
 use llm_bridge::registry::Registry;
 use llm_bridge::session::SessionStore;
 use llm_bridge::suspend::SuspendedSessions;
@@ -34,6 +35,7 @@ fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
         credentials: Credentials::default(),
         suspended: Arc::new(SuspendedSessions::new(8)),
         tool_result_timeout: Duration::from_secs(120),
+        supervisor: ProcessSupervisor::new(4),
     }
 }
 fn fake(events: Vec<AgentEvent>) -> Arc<dyn TurnRunner> { Arc::new(FakeRunner { events }) }
@@ -138,7 +140,8 @@ async fn unknown_model_404_and_tools_400() {
     let app = build_router(state(None));
     let r1 = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(r#"{"model":"nope","messages":[]}"#)).unwrap()).await.unwrap();
     assert_eq!(r1.status(), 404);
-    let r2 = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(r#"{"model":"claude-text","tools":[{"x":1}],"messages":[]}"#)).unwrap()).await.unwrap();
+    // codex does not support tools — still 400 even after Phase 4b wiring.
+    let r2 = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(r#"{"model":"codex-text","tools":[{"x":1}],"messages":[]}"#)).unwrap()).await.unwrap();
     assert_eq!(r2.status(), 400);
 }
 
@@ -152,12 +155,20 @@ async fn tools_to_codex_rejected_unsupported() {
 }
 
 #[tokio::test]
-async fn tools_to_claude_deferred_to_phase4b() {
-    let app = build_router(state(None));
+async fn tools_to_claude_503_when_pool_full() {
+    // Fill the suspended pool to capacity, then a claude tools-turn must 503 (early is_full guard),
+    // WITHOUT spawning claude.
+    let st = state(None); // SuspendedSessions::new(8) in state_with
+    for i in 0..8 {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let cont: EventStream = Box::pin(futures::stream::iter(vec![AgentEvent::Done { finish_reason: "stop".into() }]));
+        st.suspended.register(vec![(format!("c{i}"), tx)], cont).unwrap();
+    }
+    assert!(st.suspended.is_full());
+    let app = build_router(st);
     let body = r#"{"model":"claude-text","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"hi"}]}"#;
     let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(axum::body::Body::from(body)).unwrap()).await.unwrap();
-    assert_eq!(r.status(), 400);
-    assert!(body_string(r).await.contains("Phase 4b"));
+    assert_eq!(r.status(), 503);
 }
 
 fn state_with_suspension(ids: &[&str]) -> (AppState, Vec<tokio::sync::oneshot::Receiver<String>>) {

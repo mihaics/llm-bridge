@@ -47,10 +47,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // One shared supervisor -> a GLOBAL concurrency cap across all requests.
+    // One shared supervisor -> a GLOBAL concurrency cap across all requests (ordinary + tools turns).
     let supervisor = ProcessSupervisor::new(cfg.defaults.max_concurrency);
     let runner = Arc::new(EngineProcessRunner {
-        supervisor,
+        supervisor: supervisor.clone(),
         credentials: cfg.credentials.clone(),
         env_passthrough: cfg.defaults.env_passthrough.clone(),
         timeout: Duration::from_secs(cfg.defaults.timeout_s),
@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         credentials: cfg.credentials.clone(),
         suspended: Arc::new(llm_bridge::suspend::SuspendedSessions::new(cfg.defaults.max_suspended_sessions)),
         tool_result_timeout: Duration::from_secs(cfg.defaults.tool_result_timeout_s),
+        supervisor,
     };
 
     let app = build_router(state);

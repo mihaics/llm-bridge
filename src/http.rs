@@ -6,7 +6,8 @@ use crate::openai::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, DeltaFunctionCall,
     DeltaToolCall,
 };
-use crate::orchestrator::{response_from_events, run_request, runtime_fingerprint, TurnRunner};
+use crate::orchestrator::{response_from_events, run_request, run_tools_turn, runtime_fingerprint, ToolsTurn, ToolsTurnError, TurnRunner};
+use crate::process::ProcessSupervisor;
 use crate::registry::Registry;
 use crate::routing::tool_result_suffix;
 use crate::session::SessionStore;
@@ -34,7 +35,8 @@ pub struct AppState {
     pub progress_channel: ProgressChannel, // from cfg.server.progress_channel (NOT on Defaults)
     pub credentials: Credentials, // per-engine home dirs feed the runtime fingerprint
     pub suspended: Arc<SuspendedSessions>,
-    pub tool_result_timeout: Duration, // reserved for the registration path wired in Phase 4b
+    pub tool_result_timeout: Duration,
+    pub supervisor: ProcessSupervisor,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -106,13 +108,31 @@ async fn chat_completions(State(state): State<AppState>, Json(req): Json<ChatCom
                 "invalid_request_error",
             );
         }
-        // claude is MCP-capable, but the live in-process MCP bridge that creates suspensions
-        // is delivered in Phase 4b.
-        return err(
-            StatusCode::BAD_REQUEST,
-            "the MCP tool bridge is not yet enabled (Phase 4b)",
-            "invalid_request_error",
-        );
+        // claude is MCP-capable: run the live tools-turn.
+        return match run_tools_turn(
+            state.supervisor.clone(),
+            state.suspended.clone(),
+            &entry,
+            &req,
+            state.credentials.claude_config_dir.clone(),
+            state.defaults.env_passthrough.clone(),
+            state.defaults.sandbox_backend,
+            Duration::from_secs(state.defaults.timeout_s),
+            state.tool_result_timeout,
+        ).await {
+            Ok(ToolsTurn::ToolCalls(calls)) => {
+                // Reuse the existing event->wire mapping: synthesize a ToolCall event stream + Done.
+                let events: crate::engine::EventStream = Box::pin(futures::stream::iter(
+                    calls.into_iter()
+                        .map(|c| crate::engine::AgentEvent::ToolCall { id: c.id, name: c.function.name, args: c.function.arguments })
+                        .chain(std::iter::once(crate::engine::AgentEvent::Done { finish_reason: "tool_calls".into() }))
+                ));
+                finish(events, model_id, streaming, progress).await
+            }
+            Ok(ToolsTurn::Final(events)) => finish(events, model_id, streaming, progress).await,
+            Err(ToolsTurnError::Full) => err(StatusCode::SERVICE_UNAVAILABLE, "suspended tool-call pool is full; retry shortly", "overloaded"),
+            Err(ToolsTurnError::Internal(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &m, "engine_error"),
+        };
     }
 
     // (3) Ordinary turn.

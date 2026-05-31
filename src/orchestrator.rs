@@ -260,6 +260,11 @@ pub async fn run_tools_turn(
         ));
     }
 
+    // (0b) Early Full guard: if the pool is already at capacity, refuse before spawning anything.
+    if suspended.is_full() {
+        return Err(ToolsTurnError::Full);
+    }
+
     // (1) Hold the active slot for the whole collection phase.
     let permit = supervisor.acquire().await;
 
