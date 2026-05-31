@@ -44,7 +44,7 @@ work as it happens (where the engine supports it), and bridges OpenAI tool-calli
 |---|---|
 | Scope | **Full agentic passthrough** — expose file edits, tool use, sessions |
 | Workspace selection | **Config-driven model list**: config registers named tuples, each published as a model in `/v1/models`; an OpenWebUI Pipe is the escape hatch for explicit per-request dirs |
-| Session continuity | **Content-hash resume** (hit = resume + last turn; **miss = fresh + full projected conversation**), keyed on a tool-aware conversation projection **+ a ModelEntry fingerprint** |
+| Session continuity | **Content-hash resume** (hit = resume + last turn; **miss = fresh + read-only transcript replay**; index advances after *every* turn), keyed on the tool-aware projection **+ ModelEntry + tool-config + system-prompt + runtime fingerprints** (§4.5) |
 | Progress output | **Per-client profile**: OpenWebUI → `reasoning_content` (visible; excluded from our session hash + replay, so resume is unaffected regardless of client storage); strict OpenAI clients → standard chunks only (progress omitted). Final answer always → `content`. Streaming engines only |
 | OpenAI `tools` | **Bridge to MCP**; suspended sessions are a **turn-level tool-call group** (all of the turn's `tool_call_id`s); follow-up must complete the whole group |
 | Safety posture | **Sandboxed full-auto**, with a hardened HTTP/host boundary (localhost default, **dedicated provisioned credential dirs**, env isolation, path canonicalization) |
@@ -284,9 +284,15 @@ regardless of profile.
     already holds the prior context on disk).
   - **Miss** (no entry, or the index was lost on restart): start a **fresh session and feed the
     full conversation rendered as a read-only transcript** (format below), not just the last
-    turn — so context resent by OpenWebUI is never dropped. Capture the `SessionId` event and
-    store `key′ → sid` where `key′` includes the just-completed turn, so the next request
-    resolves to a hit.
+    turn — so context resent by OpenWebUI is never dropped.
+- **Index advancement — after *every* completed turn (hit, miss, or tool-call continuation).**
+  Once a turn finishes, compute `key′` over the now-extended prefix (the conversation including
+  the just-completed user turn and assistant response) and store `key′ → sid`. This is **not**
+  miss-only: after a turn-2 *hit* the conversation grew, so without storing the advanced key,
+  turn 3's prefix would not match and would needlessly miss-and-replay. The same advancement runs
+  after a suspended tool-call group resolves and its turn completes. `sid` is the same underlying
+  session id on a hit/continuation (the CLI kept it); a miss captures a new `SessionId` event
+  first.
 - **Replay transcript format (miss path).** The CLIs take a single prompt string, not structured
   Chat messages, so we render the projected history into one prompt with an explicit guard: a
   leading instruction stating the block is **prior context for reference only — do NOT
@@ -313,7 +319,12 @@ When a request carries `tools`:
 2. When the agent calls one or more tools, the bridge emits the corresponding OpenAI
    `tool_call`s (each with a generated `tool_call_id`) in the assistant turn and **ends the
    turn** with `finish_reason: "tool_calls"`. An agent may issue several MCP calls before
-   yielding, so a turn can carry **multiple** `tool_call`s.
+   yielding, so a turn can carry **multiple** `tool_call`s. **`tool_call_id`s must be globally
+   unique and high-entropy** (e.g. a random UUID/ULID, *not* a per-turn `call_0`, `call_1`
+   counter), because suspensions across concurrent requests share one `SuspendedSessions`
+   registry keyed by these ids — a collision between two simultaneous groups would route a
+   follow-up to the wrong parked process. The bridge rejects/regenerates on the astronomically
+   unlikely collision with a live id.
 3. OpenAI's protocol means the client executes the tools and returns results in a **follow-up
    request** containing the assistant message with those `tool_calls` **and** one
    `role:"tool"` message per call carrying the matching **`tool_call_id`** — *not* a new user
@@ -360,9 +371,12 @@ file edits and command execution, the boundary is hardened on multiple axes:
   bearer token or the server refuses to start. Auth on all `/v1/*` routes.
 - **Host/identity isolation + credential provisioning:** spawn each CLI with an isolated env —
   scrub/whitelist env vars and point each engine at a **dedicated service config dir** rather
-  than the operator's interactive one (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, agy's `~/.gemini`
-  equivalent). This both keeps a request from reading the operator's unrelated secrets *and*
-  supplies the auth the CLI needs — resolving the tension with "use the installed login." Each
+  than the operator's interactive one. This works for **claude (`CLAUDE_CONFIG_DIR`) and codex
+  (`CODEX_HOME`)**, which accept a redirected config/home and so are isolated from the operator's
+  unrelated secrets while still authenticated. **agy isolation is NOT yet available:** agy
+  exposes no config-dir flag and authenticates via the OS keyring (§3.2), so a service dir may
+  not redirect its credentials — agy runs under the **operator's own login (single-tenant)** and
+  its credential isolation is **gated on the §9 spike**, not assumed here. For claude/codex, each
   service dir is **provisioned once** by the operator via one of:
   1. a one-time interactive login into the service dir (`CLAUDE_CONFIG_DIR=… claude login`,
      `CODEX_HOME=… codex login`, etc.) — the documented default;
@@ -434,10 +448,11 @@ file edits and command execution, the boundary is hardened on multiple axes:
 
 ## 5. Data flow
 
-**Non-streaming chat completion** — resolve model → entry; compute session key; resolve session
-(**hit:** resume + last turn; **miss:** fresh + full projected conversation); spawn; consume
-`AgentEvent`s to completion; assemble (final text → `content`, progress per profile); return one
-`chat.completion`.
+**Non-streaming chat completion** — resolve model → entry; compute session key (§4.5: projection
++ ModelEntry + tool-config + system-prompt + runtime fingerprints); resolve session (**hit:**
+resume + last turn; **miss:** fresh + read-only transcript replay); spawn; consume `AgentEvent`s
+to completion; **advance the session index** (store `key′ → sid`); assemble (final text →
+`content`, progress per profile); return one `chat.completion`.
 
 **Streaming chat completion** — same setup, respond `text/event-stream`; each `AgentEvent` → a
 `chat.completion.chunk` (`delta.content` for final text; progress → `delta.reasoning_content`
@@ -515,14 +530,17 @@ everything else.
 - **Engine parsers** tested against **recorded CLI fixtures** (captured claude `stream-json`,
   `codex exec --json` JSONL, `agy --print` text) — no live logins in CI.
 - **Orchestrator** tested with a `FakeEngine` producing scripted `AgentEvent`s (session resume,
-  streaming channel mapping, `reasoning_content` vs `content` split, tool-call
+  **index advancement after a hit** — a 3-turn thread resumes on turn 3 rather than missing and
+  replaying, streaming channel mapping, `reasoning_content` vs `content` split, tool-call
   suspension/resume by `tool_call_id`, cancellation).
 - **MCP bridge** tested with an in-process `rmcp` client driving a scripted suspension round
   trip (single- and **multi-`tool_call`** turns), asserting: complete follow-up resumes; partial
   set → `409` (missing ids) with the suspension still live; duplicate result → `400`; unknown/
   expired id → `400`; orphan timeout reaps the child; and `max_suspended_sessions` overflow →
   `503`. Plus a **concurrency test** asserting two simultaneous tool-bearing requests get isolated
-  per-process MCP wiring (distinct temp configs / sockets, no cross-talk).
+  per-process MCP wiring (distinct temp configs / sockets, no cross-talk) **and that two identical
+  simultaneous tool-call groups route each follow-up to the correct parked process** via globally
+  unique `tool_call_id`s (no collision/misrouting).
 - **Session key** tested for fingerprint sensitivity (same id + changed workspace ⇒ different
   key; same conversation + different `tools`/`tool_choice` ⇒ different key; changed
   **system/developer prompt** ⇒ different key; changed **runtime context** — `CODEX_HOME` /
