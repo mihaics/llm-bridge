@@ -1,6 +1,6 @@
 //! ClaudeAdapter: drive `claude -p --output-format json` (non-streaming, Phase 1) with a scrubbed
 //! environment so model-run tools can't read service secrets.
-use super::{AgentEvent, EngineError, Turn};
+use super::Turn;
 use crate::config::Mode;
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -18,74 +18,6 @@ pub struct ClaudeAdapter {
 impl ClaudeAdapter {
     pub fn new(bin: &str, config_dir: Option<PathBuf>) -> Self {
         ClaudeAdapter { bin: bin.into(), config_dir }
-    }
-
-    /// Build the spawn command and the stdin payload (the user prompt). The prompt goes via stdin
-    /// (not a positional arg) because `--disallowed-tools` is variadic and would swallow it.
-    pub fn build_command(&self, turn: &Turn, env_passthrough: &[String]) -> (Command, Option<String>) {
-        let mut cmd = Command::new(&self.bin);
-
-        // Scrub the environment: start empty, re-add only the allowlist. This keeps secrets like
-        // ANTHROPIC_API_KEY out of the shells the agent may spawn (spec §4.8).
-        cmd.env_clear();
-        for (k, v) in allowlisted_env(env_passthrough, |k| std::env::var(k).ok()) {
-            cmd.env(k, v);
-        }
-
-        cmd.arg("-p").arg("--output-format").arg("json");
-        if let Some(model) = &turn.model {
-            cmd.arg("--model").arg(model);
-        }
-        if let Some(system) = &turn.system_prompt {
-            cmd.arg("--append-system-prompt").arg(system);
-        }
-        // Set AFTER env_clear/allowlist so it isn't wiped. File-based auth lives here (we never
-        // pass an API key through env for claude — see env scrub above).
-        if let Some(dir) = &self.config_dir {
-            cmd.env("CLAUDE_CONFIG_DIR", dir);
-        }
-
-        match turn.mode {
-            Mode::Text => {
-                // Pure generator: block all tools. With every tool disabled the model has no file
-                // or command access, so cwd is irrelevant; Phase 2 reinstates the empty-dir
-                // hardening under the managed run lifecycle.
-                cmd.arg("--disallowed-tools");
-                for t in BLOCKED_TOOLS {
-                    cmd.arg(t);
-                }
-            }
-            Mode::Agentic => {
-                if let Some(ws) = &turn.workspace {
-                    cmd.current_dir(ws);
-                    cmd.arg("--add-dir").arg(ws);
-                }
-                cmd.arg("--permission-mode").arg("bypassPermissions");
-            }
-        }
-
-        (cmd, Some(turn.user_prompt.clone()))
-    }
-
-    /// Parse claude's single `--output-format json` object into normalized events.
-    pub fn parse_output(&self, stdout: &str) -> Result<Vec<AgentEvent>, EngineError> {
-        let v: serde_json::Value = serde_json::from_str(stdout.trim())
-            .map_err(|e| EngineError::Parse(format!("{e}: {}", stdout.trim())))?;
-
-        if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
-            let msg = v.get("result").and_then(|r| r.as_str()).unwrap_or("claude reported an error");
-            return Ok(vec![AgentEvent::Error(msg.to_string())]);
-        }
-
-        let mut events = Vec::new();
-        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-            events.push(AgentEvent::SessionId(sid.to_string()));
-        }
-        let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
-        events.push(AgentEvent::AssistantText(result.to_string()));
-        let finish = v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("stop");
-        events.push(AgentEvent::Done { finish_reason: normalize_finish(finish) });
-        Ok(events)
     }
 
     /// Build the spawn command and stdin payload using stream-json. On resume, add `--resume <sid>`

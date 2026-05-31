@@ -67,20 +67,6 @@ impl Engine {
         }
     }
 
-    /// Build the spawn command + optional stdin payload for this turn. `env_passthrough` is the
-    /// allowlist of env vars to keep after scrubbing the rest.
-    pub fn build_command(&self, turn: &Turn, env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
-        match self {
-            Engine::Claude(a) => a.build_command(turn, env_passthrough),
-        }
-    }
-
-    pub fn parse_output(&self, stdout: &str) -> Result<Vec<AgentEvent>, EngineError> {
-        match self {
-            Engine::Claude(a) => a.parse_output(stdout),
-        }
-    }
-
     /// Build the streaming (stream-json) command + stdin payload.
     pub fn build_stream_command(&self, turn: &Turn, env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
         match self {
