@@ -4,9 +4,9 @@
 
 **Goal:** A running, config-validated, bearer-authed **OpenAI Chat Completions–compatible** HTTP server that answers `POST /v1/chat/completions` (non-streaming) by shelling out to the `claude` CLI, plus `GET /v1/models` and `GET /health`. This is the direct successor to the Python PoC (`autoid/autoid-ai-poc/scripts/claude_shim.py`), usable from OpenWebUI/LiteLLM.
 
-**Architecture:** Single Rust binary. A YAML config defines a model registry; startup validation refuses unsafe/inconsistent model postures. Each request resolves `model` → a `ModelEntry`, renders the conversation into a read-only transcript prompt, spawns `claude -p --output-format json` (PoC-style: text mode = empty dir + all tools blocked; agentic mode = workspace + bypassed permissions, gated by `trusted_caller_only`), parses the single JSON result, and returns one OpenAI `chat.completion`. Sessions are **stateless full-transcript replay** in this phase — content-hash resume, streaming, codex/agy, and the MCP bridge are later phases.
+**Architecture:** Single Rust binary. A YAML config defines a model registry; startup validation refuses unsafe/inconsistent model postures. Each request resolves `model` → a `ModelEntry`, renders the conversation into a read-only transcript prompt, and runs `claude -p --output-format json` through a shared `TurnRunner` (one global `ProcessSupervisor` enforcing `max_concurrency`). The spawned `claude` gets a **scrubbed environment** (`env_clear` + an allowlist) so model-run tools can't read service secrets; **text mode** blocks all tools (pure generator), **agentic mode** runs in the workspace with bypassed permissions, gated by `trusted_caller_only`. The single JSON result is parsed and returned as one OpenAI `chat.completion`. Sessions are **stateless full-transcript replay** in this phase.
 
-**Tech Stack:** Rust (1.93), tokio, axum 0.8, serde/serde_json, serde_yaml, tower (test), tempfile, tracing. Spec: `docs/superpowers/specs/2026-05-31-llm-bridge-design.md`.
+**Tech Stack:** Rust (1.93), tokio, axum 0.8, serde/serde_json, serde_yaml, tower (test), http-body-util (test), tracing. Spec: `docs/superpowers/specs/2026-05-31-llm-bridge-design.md`.
 
 **Scope note — this is Phase 1 of 4.** Later plans: (2) SSE streaming + session store/resume; (3) Codex + Agy adapters + `sandbox_backend` + canary probes; (4) MCP tool bridge. Phase 1 deliberately implements only what makes a working claude shim; it **refuses** (does not silently allow) anything those phases own — `sandbox_backend != none`, `stream: true`, non-claude engines, and request `tools` all return a clear error.
 
@@ -17,35 +17,35 @@
 ```
 Cargo.toml
 src/
-  main.rs          # entrypoint: load config, validate, build router, serve
-  lib.rs           # module declarations + re-exports (so integration tests can use crate)
+  main.rs          # entrypoint: load config, validate, build runner+router, serve
+  lib.rs           # module declarations (created complete in Task 0)
   openai.rs        # OpenAI Chat Completions wire types (serde)
-  config.rs        # Config schema + YAML loader
+  config.rs        # Config schema + YAML loader (+ tilde expansion)
   registry.rs      # Registry: resolve model id -> ModelEntry; /v1/models JSON; fingerprint
-  validate.rs      # startup validation (agentic-safety rules, path overlap, bind/auth)
+  validate.rs      # startup validation (bind/auth, agentic safety, path overlap)
+  transcript.rs    # render conversation -> read-only transcript prompt
+  process.rs       # ProcessSupervisor: spawn + stdin + timeout + global concurrency
   engine/
     mod.rs         # AgentEvent, Turn, Caps, EngineError, Engine enum dispatch
-    claude.rs      # ClaudeAdapter: build_command + parse_output
-  transcript.rs    # render conversation -> read-only transcript prompt
-  process.rs       # ProcessSupervisor: spawn + stdin + timeout + concurrency
-  orchestrator.rs  # turn_from_request, response_from_events, run_turn, chat_completions handler
-  http.rs          # AppState, router, /health, /v1/models, bearer auth middleware
+    claude.rs      # ClaudeAdapter: build_command (+ env scrub) + parse_output
+  orchestrator.rs  # TurnRunner trait, RunError, ClaudeProcessRunner, turn_from_request, response_from_events
+  http.rs          # AppState, router, /health, /v1/models, bearer auth, chat_completions handler
 tests/
   fixtures/claude_result.json   # recorded `claude --output-format json` object
-  http_integration.rs           # end-to-end router tests (no network engine)
+  http_integration.rs           # end-to-end router tests with a FakeRunner (hermetic)
   e2e_smoke.rs                  # feature-gated real-claude smoke test
 config.example.yaml
 README.md
 ```
 
-Each `src/*.rs` keeps its unit tests in a `#[cfg(test)] mod tests` at the bottom of the same file (Rust convention). Cross-file/router tests go in `tests/`.
+Each `src/*.rs` keeps its unit tests in a `#[cfg(test)] mod tests` at the bottom of the same file. Cross-file/router tests live in `tests/`. Modules are **filled in dependency order** (openai → config → registry → validate → engine → transcript → process → claude → orchestrator → http → main); Task 0 creates them all as empty stubs so the crate compiles after every task.
 
 ---
 
-## Task 0: Project scaffold
+## Task 0: Project scaffold (all module stubs)
 
 **Files:**
-- Create: `Cargo.toml`, `src/main.rs`, `src/lib.rs`, `.gitignore` (already exists)
+- Create: `Cargo.toml`, `src/main.rs`, `src/lib.rs`, and **empty** stub files for every module.
 
 - [ ] **Step 1: Create `Cargo.toml`**
 
@@ -76,7 +76,7 @@ http-body-util = "0.1"                              # collect response bodies in
 e2e_smoke = []
 ```
 
-- [ ] **Step 2: Create `src/lib.rs`**
+- [ ] **Step 2: Create `src/lib.rs`** (complete; all modules declared)
 
 ```rust
 pub mod config;
@@ -90,7 +90,25 @@ pub mod transcript;
 pub mod validate;
 ```
 
-- [ ] **Step 3: Create a placeholder `src/main.rs`** (real wiring lands in Task 11)
+- [ ] **Step 3: Create empty stub files so the crate compiles**
+
+Create these as **empty files** (zero bytes), except `engine/mod.rs` which must declare its submodule:
+
+```bash
+mkdir -p src/engine tests/fixtures
+: > src/openai.rs
+: > src/config.rs
+: > src/registry.rs
+: > src/validate.rs
+: > src/transcript.rs
+: > src/process.rs
+: > src/orchestrator.rs
+: > src/http.rs
+: > src/engine/claude.rs
+printf 'pub mod claude;\n' > src/engine/mod.rs
+```
+
+- [ ] **Step 4: Create a placeholder `src/main.rs`** (real wiring lands in Task 11)
 
 ```rust
 fn main() {
@@ -98,16 +116,16 @@ fn main() {
 }
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [ ] **Step 5: Verify it compiles**
 
 Run: `cargo build`
-Expected: FAILS — modules declared in `lib.rs` don't exist yet. That's fine; the next tasks create them. To get a green baseline now, temporarily comment out all `pub mod` lines in `lib.rs`, run `cargo build` (expect: `Compiling llm-bridge`, `Finished`), then restore them.
+Expected: `Compiling llm-bridge`, `Finished`. (Empty modules compile fine.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml src/main.rs src/lib.rs
-git commit -m "chore: scaffold llm-bridge crate"
+git add Cargo.toml src/ tests/
+git commit -m "chore: scaffold llm-bridge crate with empty module stubs"
 ```
 
 ---
@@ -115,7 +133,7 @@ git commit -m "chore: scaffold llm-bridge crate"
 ## Task 1: OpenAI wire types
 
 **Files:**
-- Create: `src/openai.rs`
+- Fill: `src/openai.rs`
 
 - [ ] **Step 1: Write failing tests** (append `#[cfg(test)] mod tests` at bottom of `src/openai.rs`)
 
@@ -158,7 +176,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to confirm they fail to compile**
+- [ ] **Step 2: Run tests to confirm failure**
 
 Run: `cargo test --lib openai`
 Expected: compile error (types not defined).
@@ -310,10 +328,11 @@ git commit -m "feat: OpenAI Chat Completions wire types"
 
 ---
 
-## Task 2: Config schema + YAML loader
+## Task 2: Config schema + YAML loader (+ tilde expansion)
 
 **Files:**
-- Create: `src/config.rs`, `config.example.yaml`
+- Fill: `src/config.rs`
+- Create: `config.example.yaml`
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/config.rs`)
 
@@ -321,6 +340,7 @@ git commit -m "feat: OpenAI Chat Completions wire types"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const YAML: &str = r#"
 server:
@@ -331,6 +351,7 @@ defaults:
   timeout_s: 300
   max_concurrency: 2
   sandbox_backend: none
+  env_passthrough: ["PATH", "HOME"]
 credentials:
   claude_config_dir: /home/u/.llm-bridge/cred/claude
 models:
@@ -354,6 +375,7 @@ models:
         assert_eq!(cfg.server.bearer_token.as_deref(), Some("sk-test"));
         assert_eq!(cfg.defaults.timeout_s, 300);
         assert_eq!(cfg.defaults.sandbox_backend, SandboxBackend::None);
+        assert_eq!(cfg.defaults.env_passthrough, vec!["PATH".to_string(), "HOME".to_string()]);
         assert_eq!(cfg.models.len(), 2);
         assert_eq!(cfg.models[0].mode, Mode::Text);
         assert_eq!(cfg.models[1].engine, EngineKind::Claude);
@@ -368,10 +390,18 @@ models:
   - { id: "m", engine: claude, mode: text }
 "#;
         let cfg = parse_config(yaml).unwrap();
-        assert_eq!(cfg.defaults.timeout_s, 600); // default
-        assert_eq!(cfg.defaults.max_concurrency, 4); // default
-        assert!(!cfg.models[0].trusted_caller_only); // default false
+        assert_eq!(cfg.defaults.timeout_s, 600);
+        assert_eq!(cfg.defaults.max_concurrency, 4);
+        assert_eq!(cfg.defaults.env_passthrough, default_env_passthrough());
+        assert!(!cfg.models[0].trusted_caller_only);
         assert_eq!(cfg.server.progress_channel, ProgressChannel::ReasoningContent);
+    }
+
+    #[test]
+    fn expands_leading_tilde() {
+        std::env::set_var("HOME", "/home/test");
+        assert_eq!(expand_tilde(&PathBuf::from("~/.llm-bridge/x")), PathBuf::from("/home/test/.llm-bridge/x"));
+        assert_eq!(expand_tilde(&PathBuf::from("/abs/path")), PathBuf::from("/abs/path"));
     }
 }
 ```
@@ -379,14 +409,14 @@ models:
 - [ ] **Step 2: Run tests to confirm failure**
 
 Run: `cargo test --lib config`
-Expected: compile error (types not defined).
+Expected: compile error.
 
 - [ ] **Step 3: Write the implementation** (top of `src/config.rs`)
 
 ```rust
-//! Configuration schema and YAML loader.
+//! Configuration schema, YAML loader, and leading-tilde path expansion.
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -416,6 +446,8 @@ pub struct Defaults {
     pub max_concurrency: usize,
     #[serde(default)]
     pub sandbox_backend: SandboxBackend,
+    #[serde(default = "default_env_passthrough")]
+    pub env_passthrough: Vec<String>,
 }
 
 impl Default for Defaults {
@@ -424,12 +456,17 @@ impl Default for Defaults {
             timeout_s: default_timeout_s(),
             max_concurrency: default_max_concurrency(),
             sandbox_backend: SandboxBackend::default(),
+            env_passthrough: default_env_passthrough(),
         }
     }
 }
 
 fn default_timeout_s() -> u64 { 600 }
 fn default_max_concurrency() -> usize { 4 }
+/// Non-secret vars the spawned CLI needs to run. Everything else is scrubbed (env_clear).
+pub fn default_env_passthrough() -> Vec<String> {
+    ["PATH", "HOME", "LANG", "LC_ALL", "TERM"].iter().map(|s| s.to_string()).collect()
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Credentials {
@@ -472,42 +509,73 @@ pub enum SandboxBackend { #[default] None, Bubblewrap, Container }
 #[serde(rename_all = "snake_case")]
 pub enum ProgressChannel { #[default] ReasoningContent, Omit }
 
-/// Parse config from a YAML string.
+/// Expand a leading `~/` to `$HOME`. Other paths returned unchanged.
+pub fn expand_tilde(p: &Path) -> PathBuf {
+    if let Ok(rest) = p.strip_prefix("~") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+fn expand_paths(cfg: &mut Config) {
+    for slot in [
+        &mut cfg.credentials.claude_config_dir,
+        &mut cfg.credentials.codex_home,
+        &mut cfg.credentials.agy_config_dir,
+    ] {
+        if let Some(p) = slot.as_ref() {
+            *slot = Some(expand_tilde(p));
+        }
+    }
+    for m in &mut cfg.models {
+        if let Some(ws) = m.workspace.as_ref() {
+            m.workspace = Some(expand_tilde(ws));
+        }
+    }
+}
+
+/// Parse config from a YAML string (no tilde expansion — used by tests).
 pub fn parse_config(yaml: &str) -> anyhow::Result<Config> {
     Ok(serde_yaml::from_str(yaml)?)
 }
 
-/// Load config from a file path.
-pub fn load_config(path: &std::path::Path) -> anyhow::Result<Config> {
+/// Load config from a file path, expanding leading `~/` in credential and workspace paths.
+pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
-    parse_config(&text)
+    let mut cfg = parse_config(&text)?;
+    expand_paths(&mut cfg);
+    Ok(cfg)
 }
 ```
 
 - [ ] **Step 4: Run tests to verify pass**
 
 Run: `cargo test --lib config`
-Expected: `test result: ok. 2 passed`.
+Expected: `test result: ok. 3 passed`.
 
-- [ ] **Step 5: Create `config.example.yaml`** (mirrors spec §6, claude-only for Phase 1)
+- [ ] **Step 5: Create `config.example.yaml`**
 
 ```yaml
 server:
-  bind: "127.0.0.1:8088"          # non-loopback bind requires a real bearer_token
-  bearer_token: "sk-change-me"
+  bind: "127.0.0.1:8088"          # non-loopback bind requires a strong, non-default bearer_token
+  bearer_token: "sk-change-me"    # CHANGE THIS for any non-loopback bind (validation rejects placeholders)
   progress_channel: reasoning_content
 defaults:
   timeout_s: 600
   max_concurrency: 4
   sandbox_backend: none           # Phase 1 supports only `none`; others are Phase 3
+  env_passthrough: ["PATH", "HOME", "LANG", "LC_ALL", "TERM"]   # all other env vars are scrubbed from claude
 credentials:
-  claude_config_dir: ~/.llm-bridge/cred/claude   # set CLAUDE_CONFIG_DIR; provision once via `CLAUDE_CONFIG_DIR=… claude login`
+  claude_config_dir: ~/.llm-bridge/cred/claude   # CLAUDE_CONFIG_DIR (leading ~ is expanded). Provision once:
+                                                 #   CLAUDE_CONFIG_DIR=~/.llm-bridge/cred/claude claude login
 models:
   - id: "claude-sonnet-text"
     engine: claude
     model: sonnet
-    mode: text                    # PoC-style pure generator: empty dir, all tools blocked
+    mode: text                    # PoC-style pure generator: all tools blocked
   - id: "claude-opus-repoA"
     engine: claude
     model: opus
@@ -521,7 +589,7 @@ models:
 
 ```bash
 git add src/config.rs config.example.yaml
-git commit -m "feat: config schema and YAML loader"
+git commit -m "feat: config schema, YAML loader, tilde expansion, env_passthrough"
 ```
 
 ---
@@ -529,7 +597,7 @@ git commit -m "feat: config schema and YAML loader"
 ## Task 3: Model registry + fingerprint
 
 **Files:**
-- Create: `src/registry.rs`
+- Fill: `src/registry.rs`
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/registry.rs`)
 
@@ -583,7 +651,7 @@ Expected: compile error.
 
 ```rust
 //! Model registry: resolve a request `model` id to its `ModelEntry`, serve `/v1/models`,
-//! and compute the ModelEntry fingerprint that (later) feeds the session key.
+//! and compute the ModelEntry fingerprint that (in Phase 2) feeds the session key.
 use crate::config::ModelEntry;
 use serde_json::json;
 
@@ -615,9 +683,8 @@ impl Registry {
     }
 }
 
-/// Stable fingerprint over the resolution-relevant fields of a ModelEntry.
-/// Phase 2 folds this (plus tool-config, system-prompt, and runtime fingerprints) into the
-/// session key; here it is defined and unit-tested so later phases can rely on it.
+/// Stable fingerprint over the resolution-relevant fields of a ModelEntry. Defined and tested
+/// here so Phase 2's session key can rely on it.
 pub fn model_entry_fingerprint(m: &ModelEntry) -> String {
     let canon = json!({
         "engine": format!("{:?}", m.engine),
@@ -626,8 +693,6 @@ pub fn model_entry_fingerprint(m: &ModelEntry) -> String {
         "mode": format!("{:?}", m.mode),
         "permissions": m.permissions,
     });
-    // serde_json serializes object keys in a stable (sorted-by-insertion for json! macro) order;
-    // to be deterministic across versions, serialize to a canonical string.
     let s = serde_json::to_string(&canon).expect("fingerprint serialize");
     format!("{:016x}", fnv1a(s.as_bytes()))
 }
@@ -658,10 +723,10 @@ git commit -m "feat: model registry, /v1/models body, entry fingerprint"
 
 ## Task 4: Startup validation
 
-Implements spec §4.8 startup rules that Phase 1 owns: bind/auth, agentic safety (`trusted_caller_only` or `sandbox_backend`), the Phase-1 ceiling (`sandbox_backend` must be `none`; non-claude engines rejected), and workspace↔credential path-overlap.
+Implements the spec §4.8 startup rules Phase 1 owns: bind/auth (incl. **non-default** token for non-loopback), agentic safety (`trusted_caller_only`), the Phase-1 ceiling (`sandbox_backend == none`; claude only), and workspace↔credential path-overlap.
 
 **Files:**
-- Create: `src/validate.rs`
+- Fill: `src/validate.rs`
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/validate.rs`)
 
@@ -690,12 +755,11 @@ mod tests {
 
     #[test]
     fn loopback_without_token_is_ok() {
-        let cfg = base();
-        assert!(validate_config(&cfg).is_ok());
+        assert!(validate_config(&base()).is_ok());
     }
 
     #[test]
-    fn non_loopback_requires_token() {
+    fn non_loopback_without_token_is_refused() {
         let mut cfg = base();
         cfg.server.bind = "0.0.0.0:8088".into();
         let err = validate_config(&cfg).unwrap_err();
@@ -703,7 +767,24 @@ mod tests {
     }
 
     #[test]
-    fn agentic_without_trusted_or_sandbox_is_refused() {
+    fn non_loopback_with_placeholder_token_is_refused() {
+        let mut cfg = base();
+        cfg.server.bind = "0.0.0.0:8088".into();
+        cfg.server.bearer_token = Some("sk-change-me".into());
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.iter().any(|m| m.contains("non-default")), "{err:?}");
+    }
+
+    #[test]
+    fn non_loopback_with_strong_token_is_ok() {
+        let mut cfg = base();
+        cfg.server.bind = "0.0.0.0:8088".into();
+        cfg.server.bearer_token = Some("k7Qe2vR9mZ1pX4nL8wTciuY3".into());
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn agentic_without_trusted_is_refused() {
         let mut cfg = base();
         cfg.models = vec![agentic("/work/repoA", false)];
         let err = validate_config(&cfg).unwrap_err();
@@ -740,7 +821,7 @@ mod tests {
     fn workspace_containing_credential_dir_is_refused() {
         let mut cfg = base();
         cfg.credentials.claude_config_dir = Some(PathBuf::from("/home/u/cred/claude"));
-        cfg.models = vec![agentic("/home/u", true)]; // workspace contains the cred dir
+        cfg.models = vec![agentic("/home/u", true)];
         let err = validate_config(&cfg).unwrap_err();
         assert!(err.iter().any(|m| m.contains("overlaps")), "{err:?}");
     }
@@ -755,22 +836,32 @@ Expected: compile error.
 - [ ] **Step 3: Write the implementation** (top of `src/validate.rs`)
 
 ```rust
-//! Startup validation. Returns Err(Vec<message>) listing every problem found (so the operator
-//! sees all issues at once). Phase 1 enforces the rules it owns; Phase 3 adds canary probes.
+//! Startup validation. Returns Err(Vec<message>) listing every problem (so the operator sees all
+//! issues at once). Phase 1 enforces the rules it owns; Phase 3 adds the sandbox canary probes.
 use crate::config::{Config, EngineKind, Mode, SandboxBackend};
 use std::path::{Path, PathBuf};
+
+/// Tokens we refuse for a non-loopback bind even though they are non-empty.
+const PLACEHOLDER_TOKENS: &[&str] = &["sk-change-me", "sk-noauth", "changeme", "secret", "token"];
+const MIN_TOKEN_LEN: usize = 16;
 
 pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
     let mut errs = Vec::new();
 
     // Bind / auth.
-    if !is_loopback_bind(&cfg.server.bind)
-        && cfg.server.bearer_token.as_deref().unwrap_or("").is_empty()
-    {
-        errs.push(format!(
-            "server.bind {} is non-loopback but no bearer_token is set; refusing to expose unauthenticated",
-            cfg.server.bind
-        ));
+    if !is_loopback_bind(&cfg.server.bind) {
+        let token = cfg.server.bearer_token.as_deref().unwrap_or("");
+        if token.is_empty() {
+            errs.push(format!(
+                "server.bind {} is non-loopback but no bearer_token is set; refusing to expose unauthenticated",
+                cfg.server.bind
+            ));
+        } else if PLACEHOLDER_TOKENS.contains(&token) || token.len() < MIN_TOKEN_LEN {
+            errs.push(format!(
+                "server.bind {} is non-loopback but bearer_token is a placeholder/too short; set a strong, non-default token (>= {} chars)",
+                cfg.server.bind, MIN_TOKEN_LEN
+            ));
+        }
     }
 
     // Phase-1 ceiling: only `none` sandbox backend is implemented.
@@ -781,7 +872,6 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
         ));
     }
 
-    // Credential/session dirs that workspaces must not overlap.
     let cred_dirs: Vec<PathBuf> = [
         cfg.credentials.claude_config_dir.clone(),
         cfg.credentials.codex_home.clone(),
@@ -792,7 +882,6 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
     .collect();
 
     for m in &cfg.models {
-        // Phase-1 ceiling: claude only.
         if m.engine != EngineKind::Claude {
             errs.push(format!(
                 "model '{}': only the claude engine is implemented in Phase 1 (got {:?})",
@@ -801,8 +890,6 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
         }
 
         if m.mode == Mode::Agentic {
-            // Agentic safety: no native sandbox passes read-denial, so require trusted_caller_only
-            // (since Phase 1 has no sandbox_backend).
             if !m.trusted_caller_only {
                 errs.push(format!(
                     "model '{}': agentic models require trusted_caller_only: true when sandbox_backend is none",
@@ -814,12 +901,10 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
             }
         }
 
-        // Workspace must not overlap any credential dir (else tools could read/modify secrets).
         if let Some(ws) = &m.workspace {
             let ws_r = resolve_path(ws);
             for cred in &cred_dirs {
-                let cred_r = resolve_path(cred);
-                if paths_overlap(&ws_r, &cred_r) {
+                if paths_overlap(&ws_r, &resolve_path(cred)) {
                     errs.push(format!(
                         "model '{}': workspace {} overlaps credential dir {}",
                         m.id, ws.display(), cred.display()
@@ -833,9 +918,8 @@ pub fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
 }
 
 fn is_loopback_bind(bind: &str) -> bool {
-    // bind is "host:port"; take the host part.
     let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
-    let host = host.trim_start_matches('[').trim_end_matches(']'); // ipv6 form
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -847,7 +931,6 @@ fn resolve_path(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
 }
 
-/// True if either path equals or contains the other.
 fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
 }
@@ -856,204 +939,21 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test --lib validate`
-Expected: `test result: ok. 7 passed`.
+Expected: `test result: ok. 9 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/validate.rs
-git commit -m "feat: startup config validation (bind/auth, agentic safety, path overlap)"
+git commit -m "feat: startup validation (bind/auth non-default token, agentic safety, path overlap)"
 ```
 
 ---
 
-## Task 5: HTTP skeleton — AppState, router, /health, /v1/models, bearer auth
+## Task 5: Engine core types + Engine enum
 
 **Files:**
-- Create: `src/http.rs`
-- Create: `tests/http_integration.rs`
-
-- [ ] **Step 1: Write failing integration tests** (`tests/http_integration.rs`)
-
-```rust
-use http_body_util::BodyExt;
-use llm_bridge::config::*;
-use llm_bridge::http::{build_router, AppState};
-use llm_bridge::registry::Registry;
-use std::sync::Arc;
-use tower::ServiceExt; // oneshot
-
-fn state(token: Option<&str>) -> AppState {
-    let models = vec![ModelEntry {
-        id: "claude-text".into(), engine: EngineKind::Claude, model: Some("sonnet".into()),
-        workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false,
-    }];
-    AppState {
-        registry: Arc::new(Registry::new(models)),
-        bearer_token: token.map(|s| s.to_string()),
-        credentials: Credentials::default(),
-        defaults: Defaults::default(),
-    }
-}
-
-async fn body_string(resp: axum::response::Response) -> String {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
-
-#[tokio::test]
-async fn health_ok() {
-    let app = build_router(state(None));
-    let resp = app
-        .oneshot(axum::http::Request::get("/health").body(axum::body::Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-
-#[tokio::test]
-async fn models_lists_registered_models() {
-    let app = build_router(state(None));
-    let resp = app
-        .oneshot(axum::http::Request::get("/v1/models").body(axum::body::Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body = body_string(resp).await;
-    assert!(body.contains("\"claude-text\""), "{body}");
-}
-
-#[tokio::test]
-async fn missing_bearer_token_is_401() {
-    let app = build_router(state(Some("sk-secret")));
-    let resp = app
-        .oneshot(axum::http::Request::get("/v1/models").body(axum::body::Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 401);
-}
-
-#[tokio::test]
-async fn correct_bearer_token_passes() {
-    let app = build_router(state(Some("sk-secret")));
-    let resp = app
-        .oneshot(
-            axum::http::Request::get("/v1/models")
-                .header("authorization", "Bearer sk-secret")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-```
-
-- [ ] **Step 2: Run to confirm failure**
-
-Run: `cargo test --test http_integration`
-Expected: compile error (`build_router`/`AppState` not defined).
-
-- [ ] **Step 3: Write the implementation** (`src/http.rs`)
-
-```rust
-//! HTTP layer: shared state, router, health/models endpoints, and bearer-auth middleware.
-use crate::config::{Credentials, Defaults};
-use crate::openai::ApiError;
-use crate::registry::Registry;
-use axum::{
-    extract::State,
-    http::{header::AUTHORIZATION, Request, StatusCode},
-    middleware::{from_fn_with_state, Next},
-    response::{IntoResponse, Json, Response},
-    routing::{get, post},
-    Router,
-};
-use std::sync::Arc;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub registry: Arc<Registry>,
-    pub bearer_token: Option<String>,
-    pub credentials: Credentials,
-    pub defaults: Defaults,
-}
-
-pub fn build_router(state: AppState) -> Router {
-    // `route_layer` applies the auth middleware ONLY to routes declared before it, so the two
-    // `/v1/*` routes require a bearer token while `/health` (declared after) stays open.
-    Router::new()
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(crate::orchestrator::chat_completions))
-        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
-        .route("/health", get(health))
-        .with_state(state)
-}
-
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
-}
-
-async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.registry.models_json())
-}
-
-async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    let Some(expected) = state.bearer_token.as_deref().filter(|t| !t.is_empty()) else {
-        // No token configured -> auth disabled (loopback/trusted default).
-        return next.run(req).await;
-    };
-    let presented = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(expected) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(ApiError::new("missing or invalid bearer token", "invalid_request_error")),
-        )
-            .into_response()
-    }
-}
-```
-
-> Note: this references `crate::orchestrator::chat_completions`, created in Task 10. To compile Task 5 in isolation, temporarily add a stub in `src/orchestrator.rs`:
-> ```rust
-> //! Phase 1 orchestrator (full impl in Task 10).
-> use axum::response::IntoResponse;
-> pub async fn chat_completions() -> impl IntoResponse { axum::http::StatusCode::NOT_IMPLEMENTED }
-> ```
-> Task 10 replaces this stub with the real handler.
-
-- [ ] **Step 4: Add the orchestrator stub** so the crate compiles now
-
-Create `src/orchestrator.rs` with exactly the stub shown in the note above.
-
-- [ ] **Step 5: Run to verify pass**
-
-Run: `cargo test --test http_integration`
-Expected: `test result: ok. 4 passed`.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/http.rs src/orchestrator.rs
-git commit -m "feat: HTTP router with /health, /v1/models, bearer auth"
-```
-
----
-
-## Task 6: Engine core types + Engine enum
-
-**Files:**
-- Create: `src/engine/mod.rs`
+- Fill: `src/engine/mod.rs`, `src/engine/claude.rs` (stub — real impl in Task 8)
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/engine/mod.rs`)
 
@@ -1066,9 +966,9 @@ mod tests {
     fn claude_caps() {
         let e = Engine::Claude(crate::engine::claude::ClaudeAdapter::new("claude", None));
         let c = e.caps();
-        assert!(c.streaming);       // claude supports stream-json (used in Phase 2)
+        assert!(c.streaming);          // claude supports stream-json (used in Phase 2)
         assert!(c.resume_by_id);
-        assert!(!c.mcp_tools_phase1); // MCP bridge is Phase 4
+        assert!(!c.mcp_tools_phase1);  // MCP bridge is Phase 4
     }
 
     #[test]
@@ -1086,7 +986,7 @@ mod tests {
 Run: `cargo test --lib engine`
 Expected: compile error.
 
-- [ ] **Step 3: Write the implementation** (`src/engine/mod.rs`)
+- [ ] **Step 3: Write `src/engine/mod.rs`** (replace the Task-0 `pub mod claude;` line; keep it as the first line)
 
 ```rust
 //! Engine abstraction. Production uses an enum (no `dyn`); each variant owns one CLI's quirks.
@@ -1100,19 +1000,15 @@ use thiserror::Error;
 /// A normalized unit of work handed to an adapter to build its CLI invocation.
 #[derive(Debug, Clone)]
 pub struct Turn {
-    /// System/developer instructions to pass to the engine (already merged from the request).
     pub system_prompt: Option<String>,
     /// The user-facing prompt to feed (Phase 1: full read-only transcript replay).
     pub user_prompt: String,
-    /// Underlying model name passed to the engine's `--model`.
     pub model: Option<String>,
-    /// Workspace dir for agentic mode.
     pub workspace: Option<PathBuf>,
     pub mode: Mode,
 }
 
-/// Normalized engine output events. Phase 1 emits AssistantText/SessionId/Error/Done only;
-/// ToolStart/ToolResult/ToolCall arrive in Phases 2/4.
+/// Normalized engine output events (Phase 1 subset; ToolStart/ToolResult/ToolCall in Phases 2/4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     AssistantText(String),
@@ -1125,7 +1021,7 @@ pub enum AgentEvent {
 pub struct Caps {
     pub streaming: bool,
     pub resume_by_id: bool,
-    /// Whether per-invocation MCP tool injection is safe. Always false in Phase 1 (bridge = Phase 4).
+    /// Per-invocation MCP tool injection safe? Always false in Phase 1 (bridge = Phase 4).
     pub mcp_tools_phase1: bool,
 }
 
@@ -1149,14 +1045,14 @@ impl Engine {
         }
     }
 
-    /// Build the spawn command + optional stdin payload for this turn.
-    pub fn build_command(&self, turn: &Turn) -> (tokio::process::Command, Option<String>) {
+    /// Build the spawn command + optional stdin payload for this turn. `env_passthrough` is the
+    /// allowlist of env vars to keep after scrubbing the rest.
+    pub fn build_command(&self, turn: &Turn, env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
         match self {
-            Engine::Claude(a) => a.build_command(turn),
+            Engine::Claude(a) => a.build_command(turn, env_passthrough),
         }
     }
 
-    /// Parse the engine's full stdout into normalized events.
     pub fn parse_output(&self, stdout: &str) -> Result<Vec<AgentEvent>, EngineError> {
         match self {
             Engine::Claude(a) => a.parse_output(stdout),
@@ -1165,19 +1061,20 @@ impl Engine {
 }
 ```
 
-- [ ] **Step 4:** This task depends on `claude::ClaudeAdapter` (Task 9). To compile/test Task 6 now, create a minimal `src/engine/claude.rs` stub:
+- [ ] **Step 4: Write the `src/engine/claude.rs` stub** (full impl in Task 8)
 
 ```rust
-//! ClaudeAdapter (full impl in Task 9).
+//! ClaudeAdapter (full impl in Task 8).
 use super::{AgentEvent, EngineError, Turn};
+use std::path::PathBuf;
 
-pub struct ClaudeAdapter { pub bin: String, pub config_dir: Option<std::path::PathBuf> }
+pub struct ClaudeAdapter { pub bin: String, pub config_dir: Option<PathBuf> }
 
 impl ClaudeAdapter {
-    pub fn new(bin: &str, config_dir: Option<std::path::PathBuf>) -> Self {
+    pub fn new(bin: &str, config_dir: Option<PathBuf>) -> Self {
         ClaudeAdapter { bin: bin.into(), config_dir }
     }
-    pub fn build_command(&self, _turn: &Turn) -> (tokio::process::Command, Option<String>) {
+    pub fn build_command(&self, _turn: &Turn, _env_passthrough: &[String]) -> (tokio::process::Command, Option<String>) {
         (tokio::process::Command::new(&self.bin), None)
     }
     pub fn parse_output(&self, _stdout: &str) -> Result<Vec<AgentEvent>, EngineError> {
@@ -1200,12 +1097,10 @@ git commit -m "feat: engine core types and Engine dispatch enum (claude)"
 
 ---
 
-## Task 7: Transcript renderer
-
-Renders the conversation into a single prompt for a fresh session, with the read-only guard from spec §4.5 so old instructions aren't re-executed.
+## Task 6: Transcript renderer
 
 **Files:**
-- Create: `src/transcript.rs`
+- Fill: `src/transcript.rs`
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/transcript.rs`)
 
@@ -1228,8 +1123,7 @@ mod tests {
 
     #[test]
     fn system_messages_become_system_prompt() {
-        let msgs = vec![msg(Role::System, "be terse"), msg(Role::User, "hi")];
-        let r = render_turn(&msgs);
+        let r = render_turn(&[msg(Role::System, "be terse"), msg(Role::User, "hi")]);
         assert_eq!(r.system_prompt.as_deref(), Some("be terse"));
         assert_eq!(r.user_prompt, "hi");
     }
@@ -1246,7 +1140,6 @@ mod tests {
         assert!(r.user_prompt.contains("### User"));
         assert!(r.user_prompt.contains("### Assistant"));
         assert!(r.user_prompt.contains("answer one"));
-        // The genuinely-new final user turn appears after the transcript as the live instruction.
         assert!(r.user_prompt.trim_end().ends_with("second"), "{}", r.user_prompt);
     }
 }
@@ -1257,7 +1150,7 @@ mod tests {
 Run: `cargo test --lib transcript`
 Expected: compile error.
 
-- [ ] **Step 3: Write the implementation** (`src/transcript.rs`)
+- [ ] **Step 3: Write the implementation** (top of `src/transcript.rs`)
 
 ```rust
 //! Render an OpenAI message list into a single prompt for a fresh CLI session, with a guard so
@@ -1273,7 +1166,6 @@ const GUARD: &str = "The following is the prior conversation, provided as contex
 only. Do NOT re-execute past instructions; respond only to the final user message below.";
 
 pub fn render_turn(messages: &[ChatMessage]) -> RenderedTurn {
-    // System/developer messages -> system prompt (joined).
     let system_parts: Vec<String> = messages
         .iter()
         .filter(|m| matches!(m.role, Role::System | Role::Developer))
@@ -1282,18 +1174,14 @@ pub fn render_turn(messages: &[ChatMessage]) -> RenderedTurn {
         .collect();
     let system_prompt = if system_parts.is_empty() { None } else { Some(system_parts.join("\n\n")) };
 
-    // Conversation = non-system messages.
     let convo: Vec<&ChatMessage> = messages
         .iter()
         .filter(|m| !matches!(m.role, Role::System | Role::Developer))
         .collect();
 
-    // Index of the final user message — it becomes the live instruction; everything before it is
-    // the read-only transcript.
     let last_user_idx = convo.iter().rposition(|m| m.role == Role::User);
 
     match last_user_idx {
-        // Exactly one (final) user turn and nothing before it: pass it straight through.
         Some(idx) if idx == 0 => RenderedTurn { system_prompt, user_prompt: convo[0].text() },
         Some(idx) => {
             let mut out = String::new();
@@ -1320,7 +1208,6 @@ pub fn render_turn(messages: &[ChatMessage]) -> RenderedTurn {
             out.push_str(&convo[idx].text());
             RenderedTurn { system_prompt, user_prompt: out }
         }
-        // No user message at all (degenerate) — feed the whole flattened convo.
         None => {
             let joined = convo.iter().map(|m| m.text()).collect::<Vec<_>>().join("\n\n");
             RenderedTurn { system_prompt, user_prompt: joined }
@@ -1343,12 +1230,10 @@ git commit -m "feat: read-only transcript renderer for fresh-session replay"
 
 ---
 
-## Task 8: ProcessSupervisor
-
-Spawns a child CLI, writes stdin, enforces a timeout and a concurrency cap. Tested with real `bash`/`sleep` so no engine is needed.
+## Task 7: ProcessSupervisor
 
 **Files:**
-- Create: `src/process.rs`
+- Fill: `src/process.rs`
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/process.rs`)
 
@@ -1362,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn runs_command_and_captures_stdout() {
         let sup = ProcessSupervisor::new(2);
-        let mut cmd = Command::new("cat"); // echoes stdin to stdout
+        let cmd = Command::new("cat"); // echoes stdin to stdout
         let out = sup.run(cmd, Some("hello\n".into()), Duration::from_secs(5)).await.unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
@@ -1386,6 +1271,14 @@ mod tests {
         assert_eq!(out.status.code(), Some(3));
         assert!(String::from_utf8_lossy(&out.stderr).contains("oops"));
     }
+
+    #[tokio::test]
+    async fn is_cloneable_and_shares_the_permit_pool() {
+        // Cloning shares the same Arc<Semaphore> so the cap is global, not per-clone.
+        let sup = ProcessSupervisor::new(1);
+        let sup2 = sup.clone();
+        assert!(std::sync::Arc::ptr_eq(&sup.sem, &sup2.sem));
+    }
 }
 ```
 
@@ -1394,10 +1287,11 @@ mod tests {
 Run: `cargo test --lib process`
 Expected: compile error.
 
-- [ ] **Step 3: Write the implementation** (`src/process.rs`)
+- [ ] **Step 3: Write the implementation** (top of `src/process.rs`)
 
 ```rust
-//! Spawn child CLIs with stdin, a per-turn timeout, and a global concurrency cap.
+//! Spawn child CLIs with stdin, a per-turn timeout, and a GLOBAL concurrency cap. One instance is
+//! shared across all requests (held in AppState via the runner), so cloning shares the semaphore.
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1416,7 +1310,7 @@ pub enum ProcessError {
 
 #[derive(Clone)]
 pub struct ProcessSupervisor {
-    sem: Arc<Semaphore>,
+    pub(crate) sem: Arc<Semaphore>,
 }
 
 impl ProcessSupervisor {
@@ -1459,23 +1353,23 @@ impl ProcessSupervisor {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test --lib process`
-Expected: `test result: ok. 3 passed`.
+Expected: `test result: ok. 4 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/process.rs
-git commit -m "feat: ProcessSupervisor (stdin, timeout, concurrency cap)"
+git commit -m "feat: ProcessSupervisor (stdin, timeout, shared global concurrency cap)"
 ```
 
 ---
 
-## Task 9: ClaudeAdapter (real implementation)
+## Task 8: ClaudeAdapter (real implementation, with env scrub)
 
-Replaces the Task 6 stub. Builds the `claude -p --output-format json` command (text vs agentic) and parses the single JSON result object (verified shape: keys include `result`, `session_id`, `is_error`, `stop_reason`).
+Replaces the Task 5 stub. Builds `claude -p --output-format json` (text vs agentic), **scrubs the environment** to an allowlist so model-run tools can't read service secrets, and parses the single JSON result (verified shape: keys include `result`, `session_id`, `is_error`, `stop_reason`).
 
 **Files:**
-- Modify: `src/engine/claude.rs` (replace stub)
+- Replace: `src/engine/claude.rs`
 - Create: `tests/fixtures/claude_result.json`
 
 - [ ] **Step 1: Create the recorded fixture** `tests/fixtures/claude_result.json`
@@ -1511,7 +1405,7 @@ mod tests {
     #[test]
     fn text_mode_blocks_tools_and_passes_model_and_system() {
         let a = ClaudeAdapter::new("claude", None);
-        let (cmd, stdin) = a.build_command(&turn(Mode::Text, None));
+        let (cmd, stdin) = a.build_command(&turn(Mode::Text, None), &[]);
         let args = arg_strings(&cmd);
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"json".to_string()));
@@ -1524,13 +1418,26 @@ mod tests {
     #[test]
     fn agentic_mode_adds_workspace_and_bypasses_permissions() {
         let a = ClaudeAdapter::new("claude", None);
-        let (cmd, _) = a.build_command(&turn(Mode::Agentic, Some("/work/repoA")));
+        let (cmd, _) = a.build_command(&turn(Mode::Agentic, Some("/work/repoA")), &[]);
         let args = arg_strings(&cmd);
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(args.contains(&"bypassPermissions".to_string()));
         assert!(args.contains(&"--add-dir".to_string()));
         assert!(args.iter().any(|a| a == "/work/repoA"));
-        assert!(!args.contains(&"--disallowed-tools".to_string())); // tools allowed in agentic
+        assert!(!args.contains(&"--disallowed-tools".to_string()));
+    }
+
+    #[test]
+    fn env_allowlist_keeps_only_passthrough_vars() {
+        let lookup = |k: &str| match k {
+            "PATH" => Some("/usr/bin".to_string()),
+            "SECRET" => Some("xyz".to_string()),
+            _ => None,
+        };
+        let env = allowlisted_env(&["PATH".into(), "MISSING".into()], lookup);
+        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"));
+        assert!(!env.iter().any(|(k, _)| k == "SECRET"));   // not allowlisted -> dropped
+        assert!(!env.iter().any(|(k, _)| k == "MISSING"));  // allowlisted but absent -> not added
     }
 
     #[test]
@@ -1556,12 +1463,13 @@ mod tests {
 - [ ] **Step 3: Run to confirm failure**
 
 Run: `cargo test --lib engine::claude`
-Expected: failures (stub returns empty/`Command::new(bin)` with no args).
+Expected: failures (stub returns empty / bare command).
 
 - [ ] **Step 4: Write the implementation** (replace all of `src/engine/claude.rs`)
 
 ```rust
-//! ClaudeAdapter: drive `claude -p --output-format json` (non-streaming, Phase 1).
+//! ClaudeAdapter: drive `claude -p --output-format json` (non-streaming, Phase 1) with a scrubbed
+//! environment so model-run tools can't read service secrets.
 use super::{AgentEvent, EngineError, Turn};
 use crate::config::Mode;
 use std::path::PathBuf;
@@ -1582,18 +1490,27 @@ impl ClaudeAdapter {
         ClaudeAdapter { bin: bin.into(), config_dir }
     }
 
-    /// Build the spawn command and the stdin payload (the user prompt). The prompt is passed via
-    /// stdin (not a positional arg) because `--disallowed-tools` is variadic and would swallow it.
-    pub fn build_command(&self, turn: &Turn) -> (Command, Option<String>) {
+    /// Build the spawn command and the stdin payload (the user prompt). The prompt goes via stdin
+    /// (not a positional arg) because `--disallowed-tools` is variadic and would swallow it.
+    pub fn build_command(&self, turn: &Turn, env_passthrough: &[String]) -> (Command, Option<String>) {
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("-p").arg("--output-format").arg("json");
 
+        // Scrub the environment: start empty, re-add only the allowlist. This keeps secrets like
+        // ANTHROPIC_API_KEY out of the shells the agent may spawn (spec §4.8).
+        cmd.env_clear();
+        for (k, v) in allowlisted_env(env_passthrough, |k| std::env::var(k).ok()) {
+            cmd.env(k, v);
+        }
+
+        cmd.arg("-p").arg("--output-format").arg("json");
         if let Some(model) = &turn.model {
             cmd.arg("--model").arg(model);
         }
         if let Some(system) = &turn.system_prompt {
             cmd.arg("--append-system-prompt").arg(system);
         }
+        // Set AFTER env_clear/allowlist so it isn't wiped. File-based auth lives here (we never
+        // pass an API key through env for claude — see env scrub above).
         if let Some(dir) = &self.config_dir {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
@@ -1601,9 +1518,8 @@ impl ClaudeAdapter {
         match turn.mode {
             Mode::Text => {
                 // Pure generator: block all tools. With every tool disabled the model has no file
-                // or command access, so the cwd is irrelevant and we set none in Phase 1. (The
-                // PoC's extra empty-temp-dir is defense-in-depth; Phase 2 reinstates it under the
-                // managed run lifecycle so there's no leaked dir per request.)
+                // or command access, so cwd is irrelevant; Phase 2 reinstates the empty-dir
+                // hardening under the managed run lifecycle.
                 cmd.arg("--disallowed-tools");
                 for t in BLOCKED_TOOLS {
                     cmd.arg(t);
@@ -1643,6 +1559,15 @@ impl ClaudeAdapter {
     }
 }
 
+/// The (key, value) pairs to set after `env_clear`: each allowlisted key that the lookup resolves.
+/// Pure + injectable so the policy is unit-testable without touching the real environment.
+pub(crate) fn allowlisted_env<F: Fn(&str) -> Option<String>>(
+    passthrough: &[String],
+    lookup: F,
+) -> Vec<(String, String)> {
+    passthrough.iter().filter_map(|k| lookup(k).map(|v| (k.clone(), v))).collect()
+}
+
 /// Map claude stop reasons to OpenAI finish_reasons.
 fn normalize_finish(reason: &str) -> String {
     match reason {
@@ -1657,26 +1582,25 @@ fn normalize_finish(reason: &str) -> String {
 - [ ] **Step 5: Run to verify pass**
 
 Run: `cargo test --lib engine::claude`
-Expected: `test result: ok. 4 passed`.
+Expected: `test result: ok. 5 passed`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/engine/claude.rs tests/fixtures/claude_result.json
-git commit -m "feat: ClaudeAdapter build_command + JSON result parsing"
+git commit -m "feat: ClaudeAdapter build_command (env scrub) + JSON result parsing"
 ```
 
 ---
 
-## Task 10: Orchestrator + non-streaming /v1/chat/completions
+## Task 9: Orchestrator — TurnRunner, ClaudeProcessRunner, pure helpers
 
-Wires it together: request → `Turn` → spawn claude → parse → OpenAI response. Pure helpers (`turn_from_request`, `response_from_events`) are tested directly; the handler is tested via the router with a non-claude error path (real claude is the Task 11 smoke).
+The injectable run layer + pure request/response mapping. No axum here (the handler lives in `http.rs`, Task 10), so there's no module cycle.
 
 **Files:**
-- Modify: `src/orchestrator.rs` (replace the Task 5 stub)
-- Modify: `tests/http_integration.rs` (add handler tests)
+- Fill: `src/orchestrator.rs`
 
-- [ ] **Step 1: Write failing unit tests** (`#[cfg(test)] mod tests` in `src/orchestrator.rs`)
+- [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `src/orchestrator.rs`)
 
 ```rust
 #[cfg(test)]
@@ -1737,27 +1661,78 @@ mod tests {
 - [ ] **Step 2: Run to confirm failure**
 
 Run: `cargo test --lib orchestrator`
-Expected: compile error (functions not defined; stub has no such fns).
+Expected: compile error.
 
-- [ ] **Step 3: Write the implementation** (replace all of `src/orchestrator.rs`)
+- [ ] **Step 3: Write the implementation** (top of `src/orchestrator.rs`)
 
 ```rust
-//! Turn orchestration + the non-streaming chat-completions handler.
-use crate::config::{EngineKind, Mode, ModelEntry};
-use crate::engine::{AgentEvent, Engine, EngineError, Turn};
+//! Turn orchestration: the injectable `TurnRunner`, the production `ClaudeProcessRunner`, and the
+//! pure request->Turn and events->response mappings. The HTTP handler (http.rs) calls these.
+use crate::config::ModelEntry;
 use crate::engine::claude::ClaudeAdapter;
-use crate::http::AppState;
+use crate::engine::{AgentEvent, Engine, EngineError, Turn};
 use crate::openai::{
-    ApiError, ChatCompletionRequest, ChatCompletionResponse, Choice, ResponseMessage, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, ResponseMessage, Usage,
 };
 use crate::process::{ProcessError, ProcessSupervisor};
 use crate::transcript::render_turn;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Json, Response},
-};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum RunError {
+    #[error("timed out")]
+    Timeout,
+    #[error("spawn failed: {0}")]
+    Spawn(String),
+    #[error("engine error: {0}")]
+    Engine(String),
+}
+
+pub type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>, RunError>> + Send + 'a>>;
+
+/// Injectable: runs a Turn and returns normalized events. Production spawns claude; tests fake it.
+pub trait TurnRunner: Send + Sync {
+    fn run<'a>(&'a self, entry: &'a ModelEntry, turn: Turn) -> RunFuture<'a>;
+}
+
+/// Production runner: builds the claude command, runs it through the shared supervisor, parses.
+pub struct ClaudeProcessRunner {
+    pub supervisor: ProcessSupervisor,
+    pub claude_config_dir: Option<PathBuf>,
+    pub env_passthrough: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl TurnRunner for ClaudeProcessRunner {
+    fn run<'a>(&'a self, _entry: &'a ModelEntry, turn: Turn) -> RunFuture<'a> {
+        Box::pin(async move {
+            let engine = Engine::Claude(ClaudeAdapter::new("claude", self.claude_config_dir.clone()));
+            let (cmd, stdin) = engine.build_command(&turn, &self.env_passthrough);
+            let output = self
+                .supervisor
+                .run(cmd, stdin, self.timeout)
+                .await
+                .map_err(|e| match e {
+                    ProcessError::Timeout => RunError::Timeout,
+                    ProcessError::Io(io) => RunError::Spawn(io.to_string()),
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(RunError::Engine(format!(
+                    "claude exited {}: {}",
+                    output.status,
+                    stderr.trim()
+                )));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            engine.parse_output(&stdout).map_err(|e| RunError::Engine(e.to_string()))
+        })
+    }
+}
 
 /// Map an incoming request + resolved entry into an engine Turn (fresh-session replay).
 pub fn turn_from_request(req: &ChatCompletionRequest, entry: &ModelEntry) -> Turn {
@@ -1787,7 +1762,7 @@ pub fn response_from_events(
         }
     }
     Ok(ChatCompletionResponse {
-        id: format!("chatcmpl-{}", monotonic_id()),
+        id: format!("chatcmpl-{}", unix_now()),
         object: "chat.completion",
         created: unix_now(),
         model: model_id.to_string(),
@@ -1806,98 +1781,130 @@ fn unix_now() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
-
-fn monotonic_id() -> u64 {
-    // Good enough for a response id; not security sensitive.
-    unix_now().wrapping_mul(1_000)
-}
-
-/// Build the Engine for a resolved entry (claude only in Phase 1).
-fn engine_for(entry: &ModelEntry, state: &AppState) -> Engine {
-    match entry.engine {
-        EngineKind::Claude => {
-            Engine::Claude(ClaudeAdapter::new("claude", state.credentials.claude_config_dir.clone()))
-        }
-        // Validation rejects non-claude engines at startup; this is unreachable in practice.
-        other => panic!("engine {other:?} not supported in Phase 1 (validation should have caught this)"),
-    }
-}
-
-/// POST /v1/chat/completions (non-streaming only in Phase 1).
-pub async fn chat_completions(
-    State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Response {
-    // Phase-1 unsupported request shapes -> explicit, honest errors.
-    if req.is_streaming() {
-        return err(StatusCode::BAD_REQUEST, "streaming is not implemented yet (Phase 2)", "invalid_request_error");
-    }
-    if req.has_tools() {
-        return err(StatusCode::BAD_REQUEST, "the `tools` field is not implemented yet (Phase 4)", "invalid_request_error");
-    }
-
-    let Some(entry) = state.registry.resolve(&req.model) else {
-        return err(StatusCode::NOT_FOUND, &format!("unknown model '{}'", req.model), "model_not_found");
-    };
-    let entry = entry.clone();
-
-    let turn = turn_from_request(&req, &entry);
-    let engine = engine_for(&entry, &state);
-    let (cmd, stdin) = engine.build_command(&turn);
-
-    let supervisor = ProcessSupervisor::new(state.defaults.max_concurrency);
-    let timeout = Duration::from_secs(state.defaults.timeout_s);
-
-    let output = match supervisor.run(cmd, stdin, timeout).await {
-        Ok(o) => o,
-        Err(ProcessError::Timeout) => {
-            return err(StatusCode::GATEWAY_TIMEOUT, "claude timed out", "timeout");
-        }
-        Err(ProcessError::Io(e)) => {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("spawn failed: {e}"), "engine_error");
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return err(StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("claude exited {}: {}", output.status, stderr.trim()), "engine_error");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let events = match engine.parse_output(&stdout) {
-        Ok(e) => e,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "engine_error"),
-    };
-
-    match response_from_events(events, &req.model) {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(EngineError::Reported(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &m, "engine_error"),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "engine_error"),
-    }
-}
-
-fn err(status: StatusCode, message: &str, kind: &str) -> Response {
-    (status, Json(ApiError::new(message, kind))).into_response()
-}
 ```
 
-- [ ] **Step 4: Add router-level handler tests** (append to `tests/http_integration.rs`)
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test --lib orchestrator`
+Expected: `test result: ok. 3 passed`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/orchestrator.rs
+git commit -m "feat: TurnRunner trait, ClaudeProcessRunner, request/response mapping"
+```
+
+---
+
+## Task 10: HTTP layer — AppState, router, auth, endpoints, handler (+ hermetic tests)
+
+**Files:**
+- Fill: `src/http.rs`
+- Create: `tests/http_integration.rs`
+
+- [ ] **Step 1: Write failing integration tests** (`tests/http_integration.rs`)
 
 ```rust
+use http_body_util::BodyExt;
+use llm_bridge::config::{EngineKind, Mode, ModelEntry};
+use llm_bridge::engine::{AgentEvent, Turn};
+use llm_bridge::http::{build_router, AppState};
+use llm_bridge::orchestrator::{RunFuture, TurnRunner};
+use llm_bridge::registry::Registry;
+use std::sync::Arc;
+use tower::ServiceExt; // oneshot
+
+/// A canned runner so handler tests are hermetic (no real claude).
+struct FakeRunner {
+    events: Vec<AgentEvent>,
+}
+impl TurnRunner for FakeRunner {
+    fn run<'a>(&'a self, _entry: &'a ModelEntry, _turn: Turn) -> RunFuture<'a> {
+        let events = self.events.clone();
+        Box::pin(async move { Ok(events) })
+    }
+}
+
+fn state_with(token: Option<&str>, runner: Arc<dyn TurnRunner>) -> AppState {
+    let models = vec![ModelEntry {
+        id: "claude-text".into(), engine: EngineKind::Claude, model: Some("sonnet".into()),
+        workspace: None, mode: Mode::Text, permissions: None, trusted_caller_only: false,
+    }];
+    AppState { registry: Arc::new(Registry::new(models)), bearer_token: token.map(String::from), runner }
+}
+
+fn state(token: Option<&str>) -> AppState {
+    state_with(token, Arc::new(FakeRunner { events: vec![] }))
+}
+
+async fn body_string(resp: axum::response::Response) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn health_ok() {
+    let app = build_router(state(None));
+    let resp = app.oneshot(axum::http::Request::get("/health").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn models_lists_registered_models() {
+    let app = build_router(state(None));
+    let resp = app.oneshot(axum::http::Request::get("/v1/models").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(body_string(resp).await.contains("\"claude-text\""));
+}
+
+#[tokio::test]
+async fn missing_bearer_token_is_401() {
+    let app = build_router(state(Some("sk-secret-strong-token-1234")));
+    let resp = app.oneshot(axum::http::Request::get("/v1/models").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn correct_bearer_token_passes() {
+    let app = build_router(state(Some("sk-secret-strong-token-1234")));
+    let resp = app.oneshot(
+        axum::http::Request::get("/v1/models")
+            .header("authorization", "Bearer sk-secret-strong-token-1234")
+            .body(axum::body::Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn chat_success_returns_completion() {
+    let runner = Arc::new(FakeRunner { events: vec![
+        AgentEvent::SessionId("s".into()),
+        AgentEvent::AssistantText("pong".into()),
+        AgentEvent::Done { finish_reason: "stop".into() },
+    ]});
+    let app = build_router(state_with(None, runner));
+    let body = r#"{"model":"claude-text","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app.oneshot(
+        axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let b = body_string(resp).await;
+    assert!(b.contains("\"pong\""), "{b}");
+    assert!(b.contains("chat.completion"), "{b}");
+}
+
 #[tokio::test]
 async fn chat_unknown_model_is_404() {
     let app = build_router(state(None));
     let body = r#"{"model":"nope","messages":[{"role":"user","content":"hi"}]}"#;
-    let resp = app
-        .oneshot(
-            axum::http::Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = app.oneshot(
+        axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body)).unwrap(),
+    ).await.unwrap();
     assert_eq!(resp.status(), 404);
     assert!(body_string(resp).await.contains("unknown model"));
 }
@@ -1906,50 +1913,161 @@ async fn chat_unknown_model_is_404() {
 async fn chat_streaming_is_rejected_in_phase1() {
     let app = build_router(state(None));
     let body = r#"{"model":"claude-text","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
-    let resp = app
-        .oneshot(
-            axum::http::Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = app.oneshot(
+        axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body)).unwrap(),
+    ).await.unwrap();
     assert_eq!(resp.status(), 400);
     assert!(body_string(resp).await.contains("streaming"));
 }
 ```
 
-- [ ] **Step 5: Run all tests to verify pass**
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `cargo test --test http_integration`
+Expected: compile error (`build_router`/`AppState` not defined).
+
+- [ ] **Step 3: Write the implementation** (top of `src/http.rs`)
+
+```rust
+//! HTTP layer: shared state, router, health/models endpoints, bearer-auth middleware, and the
+//! non-streaming chat-completions handler.
+use crate::openai::{ApiError, ChatCompletionRequest};
+use crate::orchestrator::{response_from_events, turn_from_request, RunError, TurnRunner};
+use crate::engine::EngineError;
+use crate::registry::Registry;
+use axum::{
+    extract::State,
+    http::{header::AUTHORIZATION, Request, StatusCode},
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Json, Response},
+    routing::{get, post},
+    Router,
+};
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub registry: Arc<Registry>,
+    pub bearer_token: Option<String>,
+    pub runner: Arc<dyn TurnRunner>,
+}
+
+pub fn build_router(state: AppState) -> Router {
+    // `route_layer` applies auth ONLY to routes declared before it, so `/v1/*` require a token
+    // while `/health` (declared after) stays open.
+    Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .route("/health", get(health))
+        .with_state(state)
+}
+
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn models(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.registry.models_json())
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.bearer_token.as_deref().filter(|t| !t.is_empty()) else {
+        return next.run(req).await; // no token configured -> auth disabled (loopback/trusted default)
+    };
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if presented == Some(expected) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError::new("missing or invalid bearer token", "invalid_request_error")),
+        )
+            .into_response()
+    }
+}
+
+/// POST /v1/chat/completions (non-streaming only in Phase 1).
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Response {
+    if req.is_streaming() {
+        return err(StatusCode::BAD_REQUEST, "streaming is not implemented yet (Phase 2)", "invalid_request_error");
+    }
+    if req.has_tools() {
+        return err(StatusCode::BAD_REQUEST, "the `tools` field is not implemented yet (Phase 4)", "invalid_request_error");
+    }
+    let Some(entry) = state.registry.resolve(&req.model) else {
+        return err(StatusCode::NOT_FOUND, &format!("unknown model '{}'", req.model), "model_not_found");
+    };
+    let entry = entry.clone();
+    let turn = turn_from_request(&req, &entry);
+
+    match state.runner.run(&entry, turn).await {
+        Ok(events) => match response_from_events(events, &req.model) {
+            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+            Err(EngineError::Reported(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &m, "engine_error"),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "engine_error"),
+        },
+        Err(RunError::Timeout) => err(StatusCode::GATEWAY_TIMEOUT, "claude timed out", "timeout"),
+        Err(RunError::Spawn(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("spawn failed: {m}"), "engine_error"),
+        Err(RunError::Engine(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &m, "engine_error"),
+    }
+}
+
+fn err(status: StatusCode, message: &str, kind: &str) -> Response {
+    (status, Json(ApiError::new(message, kind))).into_response()
+}
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test --test http_integration`
+Expected: `test result: ok. 7 passed`.
+
+- [ ] **Step 5: Run the whole suite**
 
 Run: `cargo test`
-Expected: all unit + integration tests pass (`orchestrator` 3, `http_integration` 6, plus prior tasks). No `e2e_smoke` (feature off).
+Expected: all unit + integration tests pass; no `e2e_smoke` (feature off).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/orchestrator.rs tests/http_integration.rs
-git commit -m "feat: non-streaming /v1/chat/completions over claude"
+git add src/http.rs tests/http_integration.rs
+git commit -m "feat: HTTP router, auth, and non-streaming chat-completions handler (hermetic tests)"
 ```
 
 ---
 
-## Task 11: Wire main entrypoint, e2e smoke, run docs
+## Task 11: main entrypoint, e2e smoke, run docs
 
 **Files:**
-- Modify: `src/main.rs`
-- Create: `tests/e2e_smoke.rs`
-- Create: `README.md`
+- Replace: `src/main.rs`
+- Create: `tests/e2e_smoke.rs`, `README.md`
 
 - [ ] **Step 1: Write the real `src/main.rs`**
 
 ```rust
-//! llm-bridge entrypoint: load config, validate, build router, serve.
+//! llm-bridge entrypoint: load config, validate, build the shared runner + router, serve.
 use llm_bridge::config::load_config;
 use llm_bridge::http::{build_router, AppState};
+use llm_bridge::orchestrator::ClaudeProcessRunner;
+use llm_bridge::process::ProcessSupervisor;
 use llm_bridge::registry::Registry;
 use llm_bridge::validate::validate_config;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -1967,12 +2085,20 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("{} config validation error(s); refusing to start", problems.len());
     }
 
+    // One shared supervisor -> a GLOBAL concurrency cap across all requests.
+    let supervisor = ProcessSupervisor::new(cfg.defaults.max_concurrency);
+    let runner = Arc::new(ClaudeProcessRunner {
+        supervisor,
+        claude_config_dir: cfg.credentials.claude_config_dir.clone(),
+        env_passthrough: cfg.defaults.env_passthrough.clone(),
+        timeout: Duration::from_secs(cfg.defaults.timeout_s),
+    });
+
     let bind = cfg.server.bind.clone();
     let state = AppState {
         registry: Arc::new(Registry::new(cfg.models.clone())),
         bearer_token: cfg.server.bearer_token.clone(),
-        credentials: cfg.credentials.clone(),
-        defaults: cfg.defaults.clone(),
+        runner,
     };
 
     let app = build_router(state);
@@ -1993,12 +2119,12 @@ Expected: clean build; all tests pass.
 ```rust
 //! Real-`claude` smoke test. Off by default. Run with:
 //!   cargo test --features e2e_smoke --test e2e_smoke -- --nocapture
-//! Requires a logged-in `claude` on PATH.
+//! Requires a logged-in `claude` on PATH. The env allowlist must include what claude needs to run.
 #![cfg(feature = "e2e_smoke")]
 
 use llm_bridge::config::Mode;
-use llm_bridge::engine::{AgentEvent, Engine, Turn};
 use llm_bridge::engine::claude::ClaudeAdapter;
+use llm_bridge::engine::{AgentEvent, Engine, Turn};
 use llm_bridge::process::ProcessSupervisor;
 use std::time::Duration;
 
@@ -2012,7 +2138,9 @@ async fn claude_text_mode_returns_text() {
         workspace: None,
         mode: Mode::Text,
     };
-    let (cmd, stdin) = engine.build_command(&turn);
+    let passthrough: Vec<String> =
+        ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER"].iter().map(|s| s.to_string()).collect();
+    let (cmd, stdin) = engine.build_command(&turn, &passthrough);
     let out = ProcessSupervisor::new(1)
         .run(cmd, stdin, Duration::from_secs(120))
         .await
@@ -2030,7 +2158,7 @@ async fn claude_text_mode_returns_text() {
 - [ ] **Step 4: Run the smoke test manually** (not part of `cargo test`)
 
 Run: `cargo test --features e2e_smoke --test e2e_smoke -- --nocapture`
-Expected: PASS (the model replies containing "pong"). If `claude` isn't logged in, it will fail — that's expected; the test is opt-in.
+Expected: PASS (model reply contains "pong"). If `claude` isn't logged in, or the env allowlist is missing something claude needs, it will fail — expand `passthrough` for your environment. The test is opt-in.
 
 - [ ] **Step 5: Write `README.md`**
 
@@ -2044,22 +2172,29 @@ Successor to the Python PoC; see `docs/superpowers/specs/2026-05-31-llm-bridge-d
 
 ```bash
 cp config.example.yaml config.yaml   # edit models / bearer_token
-# Provision a dedicated claude login (keeps the service off your personal config):
+# Provision a DEDICATED claude login (keeps the service off your personal config):
 CLAUDE_CONFIG_DIR=~/.llm-bridge/cred/claude claude login
 cargo run --release -- config.yaml
 ```
 
-Then point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_token`).
+Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_token`).
+
+## Security posture (Phase 1, single-user/trusted)
+- The spawned `claude` runs with a **scrubbed environment** (only `env_passthrough` vars survive),
+  so secrets like `ANTHROPIC_API_KEY` are NOT visible to model-run tools. Auth is **file-based**
+  via `CLAUDE_CONFIG_DIR`.
+- Agentic models require `trusted_caller_only: true` (no OS sandbox in Phase 1). Bind localhost;
+  front with a trusted proxy if remote. Non-loopback binds require a strong, non-default token.
 
 ## Status (Phase 1)
 - ✅ `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (non-streaming)
-- ✅ claude engine, text + agentic (`trusted_caller_only`) modes
-- ⛔ `stream: true` → 400 (Phase 2), `tools` → 400 (Phase 4), non-claude engines → refused at startup (Phase 3)
+- ✅ claude engine, text + agentic (`trusted_caller_only`) modes; global `max_concurrency`
+- ⛔ `stream: true` → 400 (Phase 2), `tools` → 400 (Phase 4), non-claude/`sandbox_backend` → refused at startup (Phase 3)
 
 ## Test
 ```bash
-cargo test                                              # hermetic unit + router tests
-cargo test --features e2e_smoke --test e2e_smoke -- --nocapture   # real claude
+cargo test                                                        # hermetic unit + router tests
+cargo test --features e2e_smoke --test e2e_smoke -- --nocapture   # real claude (opt-in)
 ```
 ````
 
@@ -2074,9 +2209,9 @@ git commit -m "feat: main entrypoint, e2e smoke test, README (Phase 1 complete)"
 
 ## Phase 1 Done — Definition of Done
 
-- `cargo build` clean; `cargo test` green (hermetic).
+- `cargo build` clean; `cargo test` green (hermetic) — including the **handler success path** via `FakeRunner`.
 - `cargo run -- config.yaml` serves `/health`, `/v1/models`, and answers `/v1/chat/completions` from claude.
-- Manual: a `curl` to `/v1/chat/completions` with a `claude-text` model returns an OpenAI-shaped completion; OpenWebUI lists and chats with the model.
-- Unsafe/unsupported config is refused at startup with clear messages; `stream`/`tools`/non-claude requests return clear errors.
+- `max_concurrency` is a single global cap (one shared `ProcessSupervisor`); the spawned claude has a scrubbed env.
+- Unsafe/unsupported config is refused at startup with clear messages (incl. non-default token, non-claude engine, `sandbox_backend != none`, workspace/cred overlap); `stream`/`tools` requests return clear 400s.
 
-**Next:** Phase 2 plan (SSE streaming + session store/resume). It will switch the ClaudeAdapter to `--output-format stream-json` (the JSONL event stream captured during planning), add the `SessionStore` + content-hash key (ModelEntry + tool-config + system-prompt + runtime fingerprints) with index advancement after every turn, and the `reasoning_content`/`omit` progress profiles.
+**Next:** Phase 2 plan (SSE streaming + session store/resume) — switch ClaudeAdapter to `--output-format stream-json`, add the `SessionStore` + content-hash key (ModelEntry + tool-config + system-prompt + runtime fingerprints) with index advancement after every turn, and the `reasoning_content`/`omit` progress profiles.
