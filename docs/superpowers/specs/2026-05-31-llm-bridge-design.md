@@ -265,15 +265,20 @@ regardless of profile.
   native session (otherwise two threads that differ only in tool activity hash identically).
 - **Key** = hash of (a) the projection of the **prefix** (all messages except the final user
   turn), (b) the **ModelEntry fingerprint** (engine, model, workspace, mode, permissions), (c) a
-  **tool-config fingerprint** — normalized `tools` definitions + `tool_choice`, and (d) the
+  **tool-config fingerprint** — normalized `tools` definitions + `tool_choice`, (d) the
   **effective system/developer instruction fingerprint** — the normalized system/developer prompt
   the turn would run under (the registry/config prompt plus any client `system`/`developer`
-  message). (c) matters because the available tool set is part of the agent's environment; (d)
-  matters because the system prompt is established when a native session is *created* — if the
-  client changes it for the same visible conversation, resuming the old session would run under
-  stale instructions. So two identical conversations with different tools **or** different system
-  prompts must **not** resume the same native session; equivalently, native resume is disabled
-  whenever either fingerprint differs from the resumed session's.
+  message), and (e) the **adapter runtime fingerprint** — the credential/home dir the native
+  session lives under (`CODEX_HOME` / `CLAUDE_CONFIG_DIR` / agy config+keyring context) and the
+  active `sandbox_backend`. (c) matters because the available tool set is part of the agent's
+  environment; (d) because the system prompt is established when a native session is *created* (a
+  changed prompt for the same visible conversation must not resume under stale instructions); (e)
+  because a `CliSessionId` only exists **within** the home dir that stored it — if the credential
+  dir or sandbox backend changes, a stored `key → CliSessionId` would point at a session absent
+  from the new home, or collide with a different native namespace. So two identical conversations
+  that differ in tools, system prompt, **or** runtime context must **not** resume the same native
+  session; native resume is disabled whenever any of these fingerprints differs from the resumed
+  session's.
 - Lookup `key → CliSessionId`:
   - **Hit:** spawn with the engine's resume flag and feed **only the new user turn** (the CLI
     already holds the prior context on disk).
@@ -387,8 +392,14 @@ file edits and command execution, the boundary is hardened on multiple axes:
   so file-based auth still depends on read-denial. Under the **single-user/trusted** model (§3.3)
   the read-exfiltration risk is **accepted and documented** (the trusted caller owns the creds);
   `sandbox_backend` is the path to drop that assumption.
-- **Workspace confinement:** canonicalize the configured workspace path, reject symlinks that
-  escape it, and pass it as the engine's only writable root (`--cd`/`--add-dir`/confined dir).
+- **Workspace confinement + credential-path separation (startup-enforced).** Canonicalize the
+  configured workspace and every `add-dir` (resolving symlinks), and pass them as the engine's
+  only writable roots (`--cd`/`--add-dir`/confined dir). **At startup, refuse any model whose
+  canonicalized workspace/add-dir overlaps a credential or session-store dir** — i.e. neither may
+  contain, equal, or be contained by `claude_config_dir` / `codex_home` / `agy_config_dir` /
+  the `session_store.path`. Without this, a model with `workspace: /home/user` would put the
+  service's own auth/session files inside codex's writable root, letting a model-run tool
+  **modify** them (write-confinement doesn't help when the secret is *inside* the workspace).
 - **Two distinct guarantees — "full-auto" ≠ "full access", and write-confinement ≠ read-secrecy:**
   - **(A) Write-confinement** (the agent can't damage/write outside its workspace): **codex
     `workspace-write` provides this natively** (verified: a write outside cwd → "Read-only file
@@ -513,8 +524,9 @@ everything else.
   `503`. Plus a **concurrency test** asserting two simultaneous tool-bearing requests get isolated
   per-process MCP wiring (distinct temp configs / sockets, no cross-talk).
 - **Session key** tested for fingerprint sensitivity (same id + changed workspace ⇒ different
-  key; same conversation + different `tools`/`tool_choice` ⇒ different key; same conversation +
-  changed **system/developer prompt** ⇒ different key) and prefix-rotation correctness.
+  key; same conversation + different `tools`/`tool_choice` ⇒ different key; changed
+  **system/developer prompt** ⇒ different key; changed **runtime context** — `CODEX_HOME` /
+  `CLAUDE_CONFIG_DIR` / `sandbox_backend` ⇒ different key) and prefix-rotation correctness.
 - **Replay transcript renderer** tested over tool-role histories: asserts past user
   instructions are framed as read-only context and only the final user turn is the live
   instruction.
@@ -526,6 +538,9 @@ everything else.
   beside the cred dir) are exercised; a model with `sandbox_backend` failing either probe blocks
   startup; a model with no `sandbox_backend` and no `trusted_caller_only` is refused (codex
   included, since it passes write-denial but fails read-denial).
+- **Workspace/credential overlap** tested: a model whose canonicalized workspace or add-dir
+  contains, equals, or is contained by any credential/session dir is refused at startup
+  (including via a symlink).
 - **End-to-end smoke** behind a feature flag that shells out to a real installed CLI (local,
   not CI).
 
@@ -539,9 +554,11 @@ everything else.
 4. `ClaudeAdapter` against recorded fixtures; real non-streaming end to end.
 5. SSE streaming + event→chunk mapping (final → `content`; progress **per configured client
    profile** — `reasoning_content` or omitted).
-6. Session Store + content-hash resume: tool-aware projection + ModelEntry fingerprint +
-   **tool-config fingerprint**; **hit = resume + last turn, miss = fresh + read-only transcript
-   replay** (defined renderer, tested over tool-role histories).
+6. Session Store + content-hash resume. Key = tool-aware projection + **all of**: ModelEntry,
+   tool-config, system/developer-prompt, and adapter-runtime (`CODEX_HOME`/`CLAUDE_CONFIG_DIR`/
+   sandbox_backend) fingerprints (the authoritative definition in §4.5). **hit = resume + last
+   turn, miss = fresh + read-only transcript replay** (defined renderer, tested over tool-role
+   histories).
 7. `CodexAdapter` (JSONL + `--output-last-message`, sandbox levels, persistent `CODEX_HOME`;
    `--ephemeral` only on `text`). `AgyAdapter` ships **stateless-replay first**; an **agy spike**
    gates `--conversation` resume **and** credential/config isolation — if either can't be
