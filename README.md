@@ -21,10 +21,12 @@ Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_to
 - Agentic models require `trusted_caller_only: true` (no OS sandbox in Phase 1). Bind localhost;
   front with a trusted proxy if remote. Non-loopback binds require a strong, non-default token.
 
-## Status (Phase 1)
-- ✅ `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (non-streaming)
-- ✅ claude engine, text + agentic (`trusted_caller_only`) modes; global `max_concurrency`
-- ⛔ `stream: true` → 400 (Phase 2), `tools` → 400 (Phase 4), non-claude/`sandbox_backend` → refused at startup (Phase 3)
+## Status (Phase 2)
+- ✅ `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` — **streaming (SSE) and non-streaming**
+- ✅ claude engine via `--output-format stream-json`; text + agentic (`trusted_caller_only`) modes
+- ✅ **Session resume** (content-hash key → `--resume`); in-memory index (restart degrades to full-transcript replay)
+- ✅ progress profiles: `reasoning_content` (OpenWebUI) / `omit` (strict clients); global `max_concurrency`
+- ⛔ `tools` → 400 (Phase 4); non-claude engines / `sandbox_backend` → refused at startup (Phase 3)
 
 ## Test
 ```bash
