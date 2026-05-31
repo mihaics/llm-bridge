@@ -27,7 +27,7 @@ pub fn render_turn(messages: &[ChatMessage]) -> RenderedTurn {
     let last_user_idx = convo.iter().rposition(|m| m.role == Role::User);
 
     match last_user_idx {
-        Some(idx) if idx == 0 => RenderedTurn { system_prompt, user_prompt: convo[0].text() },
+        Some(0) => RenderedTurn { system_prompt, user_prompt: convo[0].text() },
         Some(idx) => {
             let mut out = String::new();
             out.push_str(GUARD);
