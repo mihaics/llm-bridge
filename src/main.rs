@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         credentials: cfg.credentials.clone(),
         env_passthrough: cfg.defaults.env_passthrough.clone(),
         timeout: Duration::from_secs(cfg.defaults.timeout_s),
+        sandbox_backend: cfg.defaults.sandbox_backend,
     });
 
     let bind = cfg.server.bind.clone();

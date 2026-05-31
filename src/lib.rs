@@ -5,6 +5,7 @@ pub mod openai;
 pub mod orchestrator;
 pub mod process;
 pub mod registry;
+pub mod sandbox;
 pub mod session;
 pub mod transcript;
 pub mod validate;

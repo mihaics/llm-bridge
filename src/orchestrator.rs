@@ -1,7 +1,7 @@
 //! Turn orchestration: the streaming `TurnRunner`, the production `EngineProcessRunner`, the
 //! session-aware `run_request` (key resolution, resume vs fresh, capture + index advancement),
 //! and the events->response aggregation used by the non-streaming path.
-use crate::config::{Credentials, EngineKind, ModelEntry};
+use crate::config::{Credentials, EngineKind, ModelEntry, SandboxBackend};
 use crate::engine::agy::AgyAdapter;
 use crate::engine::claude::ClaudeAdapter;
 use crate::engine::codex::CodexAdapter;
@@ -31,6 +31,7 @@ pub struct EngineProcessRunner {
     pub credentials: Credentials,
     pub env_passthrough: Vec<String>,
     pub timeout: Duration,
+    pub sandbox_backend: SandboxBackend,
 }
 
 fn engine_label(k: EngineKind) -> &'static str {
@@ -55,6 +56,14 @@ impl TurnRunner for EngineProcessRunner {
     fn run_stream(&self, turn: Turn) -> EventStream {
         let engine = self.build_engine(turn.engine);
         let (cmd, stdin) = engine.build_stream_command(&turn, &self.env_passthrough);
+        // Expose ONLY the resolved engine's own home dir read-only inside the sandbox.
+        let engine_home = match turn.engine {
+            EngineKind::Claude => self.credentials.claude_config_dir.clone(),
+            EngineKind::Codex => self.credentials.codex_home.clone(),
+            EngineKind::Agy => self.credentials.agy_config_dir.clone(),
+        };
+        let ro_paths: Vec<PathBuf> = engine_home.into_iter().collect();
+        let cmd = crate::sandbox::maybe_wrap(self.sandbox_backend, turn.workspace.as_deref(), &ro_paths, cmd);
         let lines = self.supervisor.spawn_streaming(cmd, stdin, self.timeout);
         let kind = turn.engine;
         Box::pin(async_stream::stream! {
