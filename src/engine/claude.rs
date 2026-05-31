@@ -1,5 +1,6 @@
-//! ClaudeAdapter: drive `claude -p --output-format json` (non-streaming, Phase 1) with a scrubbed
-//! environment so model-run tools can't read service secrets.
+//! ClaudeAdapter: drive `claude -p --output-format stream-json` (events parsed line-by-line, with
+//! `--resume` for session continuity) under a scrubbed environment so model-run tools can't read
+//! service secrets.
 use super::Turn;
 use crate::config::Mode;
 use std::path::PathBuf;

@@ -1,5 +1,6 @@
 //! Engine abstraction. Production uses an enum (no `dyn`); each variant owns one CLI's quirks.
-//! Phase 1 implements only Claude and only non-streaming (single JSON object) parsing.
+//! Implements Claude via `--output-format stream-json` (events parsed line-by-line); the
+//! non-streaming endpoint aggregates the same event stream.
 pub mod claude;
 
 use crate::config::Mode;

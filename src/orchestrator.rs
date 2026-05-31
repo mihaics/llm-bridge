@@ -14,13 +14,6 @@ use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum RunError {
-    #[error("engine error: {0}")]
-    Engine(String),
-}
 
 /// Injectable streaming run layer. Production spawns claude; tests return a canned stream.
 pub trait TurnRunner: Send + Sync {
