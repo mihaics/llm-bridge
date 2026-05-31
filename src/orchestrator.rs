@@ -260,7 +260,11 @@ pub async fn run_tools_turn(
         ));
     }
 
-    // (0b) Early Full guard: if the pool is already at capacity, refuse before spawning anything.
+    // (0b) Early Full guard: a best-effort fast path that refuses before spawning anything when the
+    //      pool is already at capacity. It is NOT the authoritative cap — `register()` (step 6b) re-
+    //      checks under its mutex and also returns `Full`, so the suspension count never exceeds the
+    //      cap even if two requests race past this check. The only cost of that race is a wasted
+    //      permit + MCP/claude spawn for the loser, which then gets a `Full`; acceptable for v1.
     if suspended.is_full() {
         return Err(ToolsTurnError::Full);
     }
