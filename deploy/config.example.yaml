@@ -23,7 +23,7 @@ defaults:
   env_passthrough: ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
 
 credentials:                      # your logged-in config dirs (the "local logged-in agents" bit)
-  claude_config_dir: ~/.claude    # CLAUDE_CONFIG_DIR for the logged-in claude (this box uses ~/.claude)
+  claude_config_dir: ~/.claude    # CLAUDE_CONFIG_DIR for the logged-in claude (or a dedicated dir)
   codex_home: ~/.codex            # CODEX_HOME for the logged-in codex
   agy_config_dir: ~/.config/agy   # unused in v1 (agy reads the OS keyring) — kept for completeness
 

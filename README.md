@@ -14,6 +14,9 @@ cargo run --release -- config.yaml
 
 Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_token`).
 
+For a ready-made local **OpenWebUI + shim** stack (Docker compose + host shim + `/tmp` test
+workspaces), see [`deploy/`](deploy/README.md).
+
 ## Security posture (single-user/trusted by default)
 - Each spawned engine CLI runs with a **scrubbed environment** (only `env_passthrough` vars survive),
   so secrets like `ANTHROPIC_API_KEY` are NOT visible to model-run tools. Auth is **file-based**
@@ -37,3 +40,7 @@ Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_to
 cargo test                                                        # hermetic unit + router tests
 cargo test --features e2e_smoke --test e2e_smoke -- --nocapture   # real claude (opt-in)
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

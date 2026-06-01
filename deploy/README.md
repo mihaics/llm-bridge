@@ -7,7 +7,7 @@ locally **logged-in** `claude` / `codex` / `agy`.
 
 The shim shells out to the agent CLIs, and on this box they are host-bound:
 
-- **claude** — a versioned Node install + plugins, credentials in `~/.claude`.
+- **claude** — a versioned Node install + plugins, credentials in its `CLAUDE_CONFIG_DIR` (e.g. `~/.claude`).
 - **codex** — launched from an *ephemeral* fnm node-multishell path on your `PATH`.
 - **agy** — reads the **OS keyring** (Secret Service / D-Bus) at runtime for its login.
 
