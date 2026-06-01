@@ -24,6 +24,7 @@ the host where they already work, and OpenWebUI reaches it via `host.docker.inte
 | `.env` | **Local, gitignored** — `LLM_BRIDGE_TOKEN` (must match `config.yaml`) + `SHIM_PORT`/`OWUI_PORT`. |
 | `docker-compose.yml` | OpenWebUI, pre-pointed at the host shim (reads `.env`). |
 | `run-shim.sh` | Creates the `/tmp/llm-bridge-work/{repoA,repoB,repoC}` git workspaces, builds, runs the shim. |
+| `llm-bridge.service` | systemd `--user` unit template for running the shim as a persistent daemon. |
 
 ## Run it
 
@@ -45,6 +46,27 @@ Open **http://localhost:3000**. The model picker lists the shim's models
 Start with **`claude-sonnet-text`** — it's a pure generator (no filesystem side effects) and the
 quickest way to confirm the whole path works. The agentic models write into the throwaway
 `/tmp/llm-bridge-work` repos.
+
+## Run the shim as a persistent service (systemd `--user`)
+
+`run-shim.sh` is foreground / ad-hoc. For an always-on local daemon under **your** user — so
+`agy`'s OS keyring and your `claude`/`codex` logins work — install the bundled `--user` unit. Do
+**not** use a system service (`/etc/systemd/system`): it wouldn't have your keyring/session or logins.
+
+```bash
+cargo build --release
+cp deploy/llm-bridge.service ~/.config/systemd/user/   # then edit its paths + the fnm node-bin in PATH
+systemctl --user daemon-reload
+systemctl --user enable --now llm-bridge
+loginctl enable-linger "$USER"          # keep it running when you're not logged in
+journalctl --user -u llm-bridge -f      # logs
+```
+
+The unit comments explain the one gotcha: `codex` resolves to an *ephemeral* fnm path a service
+can't see, so `PATH` pins the stable fnm node-version bin
+(`ls -d ~/.local/share/fnm/node-versions/*/installation/bin`); `claude` + `agy` are stable in
+`~/.local/bin`. With the shim running as a service, OpenWebUI is started the same way
+(`docker compose … up -d`) — it just needs the shim reachable on `SHIM_PORT`.
 
 Stop OpenWebUI: `docker compose -f deploy/docker-compose.yml down` (add `-v` to wipe its data volume).
 
