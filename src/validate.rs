@@ -125,7 +125,7 @@ mod tests {
 
     fn base() -> Config {
         Config {
-            server: ServerConfig { bind: "127.0.0.1:8088".into(), bearer_token: None,
+            server: ServerConfig { bind: "127.0.0.1:8090".into(), bearer_token: None,
                                    progress_channel: ProgressChannel::ReasoningContent },
             defaults: Defaults::default(),
             credentials: Credentials::default(),
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn non_loopback_without_token_is_refused() {
         let mut cfg = base();
-        cfg.server.bind = "0.0.0.0:8088".into();
+        cfg.server.bind = "0.0.0.0:8090".into();
         let err = validate_config(&cfg).unwrap_err();
         assert!(err.iter().any(|m| m.contains("non-loopback")), "{err:?}");
     }
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn non_loopback_with_placeholder_token_is_refused() {
         let mut cfg = base();
-        cfg.server.bind = "0.0.0.0:8088".into();
+        cfg.server.bind = "0.0.0.0:8090".into();
         cfg.server.bearer_token = Some("sk-change-me".into());
         let err = validate_config(&cfg).unwrap_err();
         assert!(err.iter().any(|m| m.contains("non-default")), "{err:?}");
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn non_loopback_with_strong_token_is_ok() {
         let mut cfg = base();
-        cfg.server.bind = "0.0.0.0:8088".into();
+        cfg.server.bind = "0.0.0.0:8090".into();
         cfg.server.bearer_token = Some("k7Qe2vR9mZ1pX4nL8wTciuY3".into());
         assert!(validate_config(&cfg).is_ok());
     }

@@ -173,7 +173,7 @@ mod tests {
 
     const YAML: &str = r#"
 server:
-  bind: "127.0.0.1:8088"
+  bind: "127.0.0.1:8090"
   bearer_token: "sk-test"
   progress_channel: reasoning_content
 defaults:
@@ -200,7 +200,7 @@ models:
     #[test]
     fn parses_full_config() {
         let cfg = parse_config(YAML).unwrap();
-        assert_eq!(cfg.server.bind, "127.0.0.1:8088");
+        assert_eq!(cfg.server.bind, "127.0.0.1:8090");
         assert_eq!(cfg.server.bearer_token.as_deref(), Some("sk-test"));
         assert_eq!(cfg.defaults.timeout_s, 300);
         assert_eq!(cfg.defaults.sandbox_backend, SandboxBackend::None);
