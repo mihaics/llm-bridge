@@ -12,7 +12,7 @@ CLAUDE_CONFIG_DIR=~/.llm-bridge/cred/claude claude login
 cargo run --release -- config.yaml
 ```
 
-Point OpenWebUI/LiteLLM at `http://127.0.0.1:8088/v1` (api key = your `bearer_token`).
+Point OpenWebUI/LiteLLM at `http://127.0.0.1:8090/v1` (api key = your `bearer_token`).
 
 For a ready-made local **OpenWebUI + shim** stack (Docker compose + host shim + `/tmp` test
 workspaces), see [`deploy/`](deploy/README.md).

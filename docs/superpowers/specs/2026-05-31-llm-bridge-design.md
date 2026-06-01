@@ -472,7 +472,7 @@ expired ids → `400`; see §4.6.)
 
 ```yaml
 server:
-  bind: "127.0.0.1:8088"        # non-loopback bind requires a real bearer_token
+  bind: "127.0.0.1:8090"        # non-loopback bind requires a real bearer_token
   bearer_token: "sk-..."        # required if bind is non-loopback
   progress_channel: reasoning_content  # reasoning_content (OpenWebUI) | omit (strict OpenAI)
 defaults:

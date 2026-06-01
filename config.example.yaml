@@ -1,5 +1,5 @@
 server:
-  bind: "127.0.0.1:8088"          # non-loopback bind requires a strong, non-default bearer_token
+  bind: "127.0.0.1:8090"          # non-loopback bind requires a strong, non-default bearer_token
   bearer_token: "sk-change-me"    # CHANGE THIS for any non-loopback bind (validation rejects placeholders)
   progress_channel: reasoning_content
 defaults:

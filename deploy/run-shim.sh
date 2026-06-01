@@ -42,6 +42,6 @@ echo "==> Building llm-bridge (release)"
 cargo build --release --manifest-path "$REPO/Cargo.toml"
 
 PORT="$(sed -nE 's/.*bind:[[:space:]]*"[^:]*:([0-9]+)".*/\1/p' "$HERE/config.yaml" | head -1)"
-echo "==> Starting shim on 0.0.0.0:${PORT:-8088}  (config: $HERE/config.yaml)"
-echo "    OpenWebUI (in Docker) will reach it at http://host.docker.internal:${PORT:-8088}/v1"
+echo "==> Starting shim on 0.0.0.0:${PORT:-8090}  (config: $HERE/config.yaml)"
+echo "    OpenWebUI (in Docker) will reach it at http://host.docker.internal:${PORT:-8090}/v1"
 exec "$REPO/target/release/llm-bridge" "$HERE/config.yaml"

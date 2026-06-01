@@ -8,7 +8,7 @@ server:
   # 0.0.0.0 so the OpenWebUI container can reach the host shim (host-gateway). A non-loopback
   # bind REQUIRES a strong bearer_token (>=16 chars, not a placeholder). Keep this token in sync
   # with deploy/.env (LLM_BRIDGE_TOKEN), which docker-compose.yml reads.
-  bind: "0.0.0.0:8090"            # 8090 to avoid colliding with anything already on 8088
+  bind: "0.0.0.0:8090"            # 0.0.0.0 so the OpenWebUI container can reach the host (host-gateway)
   bearer_token: "REPLACE-with-a-strong-token-min-16-chars"
   progress_channel: reasoning_content
 
